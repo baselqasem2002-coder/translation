@@ -1863,31 +1863,19 @@ int commit_translated_rtns_to_tc2()
 }
 
 
-/****************************/
-/* create_tc2_thread_func() */
-/****************************/
-void create_tc2_thread_func(void *v)
+/****************/
+/* create_tc2() */
+/****************/
+// Builds TC2 from the instructions of TC and redirects each TC routine head
+// to its TC2 copy. Called by create_tc2_thread_func() once profiling stopped.
+// Returns 0 on success, -1 on failure (execution then simply stays in TC).
+int create_tc2()
 {
-   // Wait prof_time seconds for the profiling to count
-    // execution frequency for each BBL.
-    cerr << " prof time: " << dec << KnobNumSecsDuringProfile << " sec\n";
-    sleep(KnobNumSecsDuringProfile);
-
-    cerr << "disabling profile gathering\n";
-
-    // disable profiling.
-    //  Add a jump at beginning of every profile stub to bypass the
-	//  profiling counters in TC.
-    int rc = disable_profiling_in_tc(instr_map, num_of_instr_map_entries);
-    if  (rc < 0)
-      return;
-
-    // Print the indirect jump/call target profile (debug, -dump_prof).
-    if (KnobDumpProfile)
-      dump_indirect_profile();
+    int rc = 0;
 
 	// Step 1: Modify instr_map to be used for TC2.
     //
+    unsigned num_removed_prof_instrs = 0;
     for (unsigned i = 0; i < num_of_instr_map_entries; i++) {    
        // Set new_ins_addr to be the orig_ins_addr.
        instr_map[i].orig_ins_addr = instr_map[i].new_ins_addr;
@@ -1903,6 +1891,19 @@ void create_tc2_thread_func(void *v)
            instr_map[i].xed_category == XED_CATEGORY_NOP)
          instr_map[i].size = 0;
 
+       // Remove the profiling stubs: the counters are only needed in TC.
+       // (The original code only removed the NOP at the head of each stub,
+       // so TC2 kept executing all the counting instructions.)
+       // An instr of size 0 is not written into TC2, and a branch whose
+       // target is a removed instr lands on the next instr that is kept.
+       // For a removed stub this is the original instr the stub was put
+       // in front of, so control flow does not change.
+       if (instr_map[i].ins_type == ProfilingIns) {
+         if (instr_map[i].size)
+           num_removed_prof_instrs++;
+         instr_map[i].size = 0;
+       }
+
        // Fix orig_targ_addr by new_ins_addr and targ_map_entry.
        if (instr_map[i].targ_map_entry >= 0) {
          ADDRINT new_targ_addr = instr_map[instr_map[i].targ_map_entry].new_ins_addr;
@@ -1914,7 +1915,8 @@ void create_tc2_thread_func(void *v)
        instr_map[i].targ_map_entry = -1;
     }
     
-    cerr << "after modifying instr_map" << endl;
+    cerr << "after modifying instr_map (removed " << dec << num_removed_prof_instrs
+         << " profiling instrs)" << endl;
     
     // Step 3: Chaining - calculate direct branch and call instructions to point
     //         to corresponding target instr entries:
@@ -1924,7 +1926,11 @@ void create_tc2_thread_func(void *v)
 
     // Step 4: Set initial estimated new addrs for each instruction in tc2.
     //
-    set_initial_estimated_new_ins_addrs_in_tc(tc2);
+    rc = set_initial_estimated_new_ins_addrs_in_tc(tc2);
+    if (rc < 0) {
+        cerr << "failed to set initial estimated new ins addrs in TC2\n";
+        return -1;
+    }
     cerr << "after setting initial estimated new ins addrs in tc2" << endl;
 
     // Step 5: fix rip-based, direct branch and direct call displacements:
@@ -1932,7 +1938,7 @@ void create_tc2_thread_func(void *v)
     rc = fix_instructions_displacements();
     if (rc < 0 ) {
         cerr << "failed to fix displacments of translated instructions\n";
-        return;
+        return -1;
     }
     cerr << "after fixing instructions displacements" << endl;
 
@@ -1941,10 +1947,11 @@ void create_tc2_thread_func(void *v)
     rc = copy_instrs_to_tc(tc2);
     if (rc < 0 ) {
         cerr << "failed to copy the instructions to the translation cache\n";
-        return;
+        return -1;
     }
     tc2_size = rc;
-    cerr << "after write all new instructions to tc2" << endl;
+    cerr << "after write all new instructions to tc2 (TC size: " << dec << tc_size
+         << " bytes, TC2 size: " << tc2_size << " bytes)" << endl;
 
     // Step 7: Commit the translated routines:
     //         Go over the candidate functions and replace the original ones
@@ -1953,7 +1960,7 @@ void create_tc2_thread_func(void *v)
       rc = commit_translated_rtns_to_tc2();
       if (rc < 0 ) {
           cerr << "failed to commit jump instructions from TC to TC2\n";
-          return;
+          return -1;
       }
       cerr << "after commit of translated routines from TC to TC2" << endl;
     }
@@ -1962,6 +1969,35 @@ void create_tc2_thread_func(void *v)
         cerr << "Translation Cache 2 dump:" << endl;
         dump_tc(tc2, tc2_size);
     }
+    return 0;
+}
+
+/****************************/
+/* create_tc2_thread_func() */
+/****************************/
+void create_tc2_thread_func(void *v)
+{
+   // Wait prof_time seconds for the profiling to count
+    // execution frequency for each BBL.
+    cerr << " prof time: " << dec << KnobNumSecsDuringProfile << " sec\n";
+    sleep(KnobNumSecsDuringProfile);
+
+    cerr << "disabling profile gathering\n";
+
+    // disable profiling.
+    //  Add a jump at beginning of every profile stub to bypass the
+	//  profiling counters in TC.
+    // (Still needed with TC2: a thread that is inside a TC routine when
+    //  we switch, e.g. main()'s loop, keeps running that TC code.)
+    int rc = disable_profiling_in_tc(instr_map, num_of_instr_map_entries);
+    if  (rc < 0)
+      return;
+
+    // Print the indirect jump/call target profile (debug, -dump_prof).
+    if (KnobDumpProfile)
+      dump_indirect_profile();
+
+    create_tc2();
  
     clock_gettime(CLOCK_MONOTONIC, &start_running_time);
 
