@@ -117,6 +117,9 @@ KNOB<UINT> KnobDevirtPercent(KNOB_MODE_WRITEONCE,    "pintool",
 KNOB<BOOL> KnobNoDevirt(KNOB_MODE_WRITEONCE,    "pintool",
     "no_devirt", "0", "Do not apply de-virtualization in TC2");
 
+KNOB<BOOL> KnobNoReorder(KNOB_MODE_WRITEONCE,    "pintool",
+    "no_reorder", "0", "Do not apply code reordering in TC2");
+
 
 /* ===================================================================== */
 /* Global Variables */
@@ -2127,6 +2130,249 @@ static int insert_devirt_sites(const std::map<unsigned, ADDRINT> &sites,
     return 0;
 }
 
+/* ============================================================= */
+/* Code reordering (TC2)                                         */
+/* ============================================================= */
+//
+// THRESHOLD ("frequent" vs "rare" basic block):
+//   A BBL is HOT (frequent) if it was executed at least once during
+//   profiling, and COLD (rare) if its profiling counter is 0.
+//
+// LAYOUT: inside every routine of TC2 the BBLs are placed in this order:
+//   1. the entry BBL (it must stay first: TC jumps to the routine start),
+//   2. the other hot BBLs, in their original order,
+//   3. the cold BBLs, in their original order (moved to the routine end).
+//   So the code that really runs is packed together (fewer i-cache lines),
+//   and the hot path no longer jumps over cold code.
+//
+// FIXING THE FALL-THROUGH: a BBL that does not end with jmp/ret continues
+// ("falls through") into its original next BBL F. After reordering, for
+// such a BBL:
+//   - if F is still placed right after it: nothing to do;
+//   - else if it ends with 'jcc T' and T is now placed right after it:
+//     reverse the condition, 'jcc T' -> 'jncc F' (like the course's
+//     reverse_cond_jumps example). The hot path now falls through into T
+//     without a taken branch;
+//   - else: add 'jmp F' after it.
+//
+// Routines containing LOOP/LOOPE/LOOPNE/JRCXZ are not reordered: these
+// branches only have an 8-bit displacement (the target could end up too far
+// away) and have no reversed form.
+
+unsigned num_reordered_rtns = 0;
+unsigned num_moved_cold_bbls = 0;
+unsigned num_reversed_cond_branches = 0;
+unsigned num_added_fallthru_jumps = 0;
+
+// The reversed condition of a conditional jump, or XED_ICLASS_INVALID.
+static xed_iclass_enum_t reverse_cond_iclass(xed_iclass_enum_t iclass)
+{
+    switch (iclass) {
+      case XED_ICLASS_JB:   return XED_ICLASS_JNB;
+      case XED_ICLASS_JBE:  return XED_ICLASS_JNBE;
+      case XED_ICLASS_JL:   return XED_ICLASS_JNL;
+      case XED_ICLASS_JLE:  return XED_ICLASS_JNLE;
+      case XED_ICLASS_JNB:  return XED_ICLASS_JB;
+      case XED_ICLASS_JNBE: return XED_ICLASS_JBE;
+      case XED_ICLASS_JNL:  return XED_ICLASS_JL;
+      case XED_ICLASS_JNLE: return XED_ICLASS_JLE;
+      case XED_ICLASS_JNO:  return XED_ICLASS_JO;
+      case XED_ICLASS_JNP:  return XED_ICLASS_JP;
+      case XED_ICLASS_JNS:  return XED_ICLASS_JS;
+      case XED_ICLASS_JNZ:  return XED_ICLASS_JZ;
+      case XED_ICLASS_JO:   return XED_ICLASS_JNO;
+      case XED_ICLASS_JP:   return XED_ICLASS_JNP;
+      case XED_ICLASS_JS:   return XED_ICLASS_JNS;
+      case XED_ICLASS_JZ:   return XED_ICLASS_JNZ;
+      default:              return XED_ICLASS_INVALID;   // e.g. JRCXZ, LOOP
+    }
+}
+
+static xed_iclass_enum_t entry_iclass(const instr_map_t *e)
+{
+    xed_decoded_inst_t xedd;
+    xed_decoded_inst_zero_set_mode(&xedd, &dstate);
+    if (xed_decode(&xedd, reinterpret_cast<const UINT8*>(e->encoded_ins), max_inst_len) != XED_ERROR_NONE)
+      return XED_ICLASS_INVALID;
+    return xed_decoded_inst_get_iclass(&xedd);
+}
+
+// A group of consecutive instr_map entries forming one BBL of TC2.
+typedef struct {
+    unsigned first, last;   // entry range [first, last]
+    int      term;          // last entry with size > 0 (-1 if none)
+    UINT64   count;         // BBL execution count during profiling
+} tc2_bbl_t;
+
+// Emit a new entry at the end of instr_map: a direct branch 'iclass'
+// (JMP or a Jcc) whose target is the entry with orig_ins_addr == targ_key.
+static int emit_branch_to_key(xed_iclass_enum_t iclass, ADDRINT targ_key, unsigned bbl)
+{
+    xed_encoder_instruction_t enc_instr;
+    xed_inst1(&enc_instr, dstate, iclass, 64, xed_relbr(0, 32));
+    if (add_new_encoded_instr(0, &enc_instr, RegularIns) < 0)
+      return -1;
+    instr_map_t *e = &instr_map[num_of_instr_map_entries - 1];
+    e->orig_ins_addr = 0;           // new instr: no address of its own
+    e->orig_targ_addr = targ_key;   // resolved by chaining
+    e->bbl_num = bbl;
+    return 0;
+}
+
+// Step 1c of create_tc2(): reorder the BBLs of every routine (see above).
+// Runs after Step 1/1b (orig_ins_addr fields hold TC addresses, which chaining
+// uses as keys, so moving entries does not break branch targets).
+// 'internal_branches' (entry index pairs of de-virtualized calls) are
+// remapped to the new entry indices.
+static int reorder_bbls(std::vector<std::pair<unsigned, unsigned> > &internal_branches)
+{
+    unsigned old_num = num_of_instr_map_entries;
+    instr_map_t *old_map = instr_map;
+    if (!old_num)
+      return 0;
+
+    // 1. Split instr_map into BBLs. A new BBL starts where bbl_num changes
+    //    and at every routine head (a BBL can run past the end of a routine
+    //    that does not end with jmp/ret).
+    std::vector<tc2_bbl_t> bbls;
+    std::vector<unsigned> rtn_first_bbl;       // index into bbls of each routine start
+    for (unsigned i = 0; i < old_num; i++) {
+      bool rtn_head = (old_map[i].ins_type == RtnHeadIns);
+      if (i == 0 || rtn_head || old_map[i].bbl_num != old_map[i - 1].bbl_num) {
+        tc2_bbl_t b;
+        b.first = b.last = i;
+        b.term = -1;
+        b.count = (old_map[i].bbl_num < bbl_num) ? bbl_map[old_map[i].bbl_num].counter : 0;
+        bbls.push_back(b);
+        if (rtn_head || i == 0)
+          rtn_first_bbl.push_back(bbls.size() - 1);
+      }
+      bbls.back().last = i;
+      if (old_map[i].size)
+        bbls.back().term = i;
+    }
+    rtn_first_bbl.push_back(bbls.size());      // end marker
+
+    // Map an entry key (orig_ins_addr) to its BBL, for cond-branch targets.
+    std::map<ADDRINT, unsigned> key_to_bbl;
+    for (unsigned b = 0; b < bbls.size(); b++)
+      for (unsigned i = bbls[b].first; i <= bbls[b].last; i++)
+        if (old_map[i].orig_ins_addr)
+          key_to_bbl.emplace(old_map[i].orig_ins_addr, b);
+
+    // 2. Build the new instr_map, routine by routine.
+    unsigned extra = 2 * bbls.size() + 16;        // at most 1 added jmp per BBL
+    instr_map_t *new_map = (instr_map_t *)calloc(max_ins_count + extra, sizeof(instr_map_t));
+    if (new_map == NULL) {
+      perror("calloc");
+      return -1;
+    }
+    instr_map = new_map;
+    max_ins_count += extra;
+    num_of_instr_map_entries = 0;
+    std::vector<unsigned> new_index(old_num + 1, 0);
+
+    for (unsigned r = 0; r + 1 < rtn_first_bbl.size(); r++) {
+      unsigned rb = rtn_first_bbl[r], re = rtn_first_bbl[r + 1];   // BBLs [rb, re)
+
+      // Can this routine be reordered?
+      bool can_reorder = !KnobNoReorder && (re - rb) >= 3;
+      bool has_cold = false, has_hot = false;
+      for (unsigned b = rb + 1; b < re && can_reorder; b++) {
+        if (bbls[b].count) has_hot = true; else has_cold = true;
+      }
+      for (unsigned i = bbls[rb].first; i <= bbls[re - 1].last && can_reorder; i++) {
+        if (!old_map[i].size || old_map[i].xed_category != XED_CATEGORY_COND_BR)
+          continue;
+        if (reverse_cond_iclass(entry_iclass(&old_map[i])) == XED_ICLASS_INVALID)
+          can_reorder = false;                    // LOOP / JRCXZ (or unknown)
+      }
+      // Nothing to gain unless a cold BBL sits before a hot one.
+      bool cold_before_hot = false;
+      for (unsigned b = rb + 1, seen_cold = 0; b < re && can_reorder; b++) {
+        if (!bbls[b].count) seen_cold = 1;
+        else if (seen_cold) cold_before_hot = true;
+      }
+      if (!has_cold || !has_hot || !cold_before_hot)
+        can_reorder = false;
+
+      // The layout order of this routine's BBLs.
+      std::vector<unsigned> order;
+      order.push_back(rb);                                 // entry BBL first
+      for (unsigned b = rb + 1; b < re; b++)
+        if (!can_reorder || bbls[b].count) order.push_back(b);   // hot BBLs
+      if (can_reorder) {
+        for (unsigned b = rb + 1; b < re; b++)
+          if (!bbls[b].count) { order.push_back(b); num_moved_cold_bbls++; }  // cold BBLs
+        num_reordered_rtns++;
+      }
+
+      for (unsigned k = 0; k < order.size(); k++) {
+        const tc2_bbl_t &b = bbls[order[k]];
+        // BBL placed right after this one (the next routine starts after the last).
+        unsigned next_in_layout = (k + 1 < order.size()) ? order[k + 1] : re;
+        unsigned orig_next = order[k] + 1;                 // the fall-through BBL F
+
+        // How does this BBL end?
+        bool falls_through = true, is_cond = false;
+        if (b.term >= 0) {
+          xed_category_enum_t cat = old_map[b.term].xed_category;
+          if (cat == XED_CATEGORY_UNCOND_BR || cat == XED_CATEGORY_RET)
+            falls_through = false;
+          is_cond = (cat == XED_CATEGORY_COND_BR);
+        }
+        bool need_fix = can_reorder && falls_through && orig_next < bbls.size() &&
+                        next_in_layout != orig_next;
+        bool reverse = false;
+        if (need_fix && is_cond) {
+          std::map<ADDRINT, unsigned>::const_iterator t =
+              key_to_bbl.find(old_map[b.term].orig_targ_addr);
+          reverse = (t != key_to_bbl.end() && t->second == next_in_layout);
+        }
+
+        // Copy the BBL (with the cond branch reversed if needed).
+        for (unsigned i = b.first; i <= b.last; i++) {
+          new_index[i] = num_of_instr_map_entries;
+          if (reverse && (int)i == b.term) {
+            // 'jcc T' -> 'jncc F': F's first entry is the new target.
+            if (emit_branch_to_key(reverse_cond_iclass(entry_iclass(&old_map[i])),
+                                   old_map[bbls[orig_next].first].orig_ins_addr,
+                                   old_map[i].bbl_num) < 0)
+              return -1;
+            instr_map[num_of_instr_map_entries - 1].orig_ins_addr = old_map[i].orig_ins_addr;
+            num_reversed_cond_branches++;
+            continue;
+          }
+          instr_map[num_of_instr_map_entries++] = old_map[i];
+        }
+        // Add 'jmp F' when F is no longer next and no reversal fixed it.
+        if (need_fix && !reverse) {
+          if (emit_branch_to_key(XED_ICLASS_JMP, old_map[bbls[orig_next].first].orig_ins_addr,
+                                 old_map[b.last].bbl_num) < 0)
+            return -1;
+          num_added_fallthru_jumps++;
+        }
+        if (num_of_instr_map_entries + 2 >= max_ins_count)
+          return -1;
+      }
+    }
+    new_index[old_num] = num_of_instr_map_entries;
+
+    // 3. Remap indices that point into instr_map.
+    for (unsigned k = 0; k < internal_branches.size(); k++) {
+      internal_branches[k].first = new_index[internal_branches[k].first];
+      internal_branches[k].second = new_index[internal_branches[k].second];
+    }
+    for (unsigned b = 0; b < bbl_num; b++) {
+      if (bbl_map[b].starting_ins_entry <= old_num)
+        bbl_map[b].starting_ins_entry = new_index[bbl_map[b].starting_ins_entry];
+      if (bbl_map[b].terminating_ins_entry <= old_num)
+        bbl_map[b].terminating_ins_entry = new_index[bbl_map[b].terminating_ins_entry];
+    }
+    free(old_map);
+    return 0;
+}
+
 /****************/
 /* create_tc2() */
 /****************/
@@ -2207,6 +2453,18 @@ int create_tc2()
          << num_devirt_skip_not_translated << " target not translated, "
          << num_devirt_skip_far_targ << " target above 2GB, "
          << num_devirt_skip_other << " other" << endl;
+
+    // Step 1c: Code reordering - move the cold BBLs of every routine to its
+    //          end, reversing cond branches / adding jumps where needed.
+    rc = reorder_bbls(devirt_internal_branches);
+    if (rc < 0) {
+        cerr << "failed to reorder the code for TC2\n";
+        return -1;
+    }
+    cerr << "code reordering: " << dec << num_reordered_rtns << " routines, "
+         << num_moved_cold_bbls << " cold BBLs moved to routine end, "
+         << num_reversed_cond_branches << " cond branches reversed, "
+         << num_added_fallthru_jumps << " jumps added" << endl;
     
     // Step 3: Chaining - calculate direct branch and call instructions to point
     //         to corresponding target instr entries:
