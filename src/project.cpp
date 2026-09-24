@@ -39,7 +39,8 @@ END_LEGAL */
 /*! @file
  * This probe pintool generates translated code of all the routines, places them 
  * in an allocated Translation Cache (TC) along with instrumentation instructions that collect 
- * profiling for each BBL and for each indirect jump target.
+ * profiling for each BBL and for each indirect jump target and indirect call target
+ * (used for de-virtualization in TC2).
  *
  * The pintool generates translated code of routines, while adding a NOP7
  * instruction at the head of every translated routine, places them in an allocated
@@ -174,6 +175,13 @@ unsigned max_ins_count = 0;
 
 #define MAX_TARG_ADDRS 0x3
 
+// Kind of indirect control transfer that terminates a BBL.
+typedef enum {
+  NoIndirect = 0,
+  IndirectJump,   // jmp reg / jmp [mem]
+  IndirectCall,   // call reg / call [mem]
+} indirect_kind_t;
+
 // Bbl map of all the bbl exec counters to be collected at runtime:
 typedef struct {
   UINT64 counter;
@@ -182,6 +190,11 @@ typedef struct {
   UINT64  targ_count[MAX_TARG_ADDRS+1];
   unsigned starting_ins_entry;
   unsigned terminating_ins_entry;
+  // Set for BBLs that end with an indirect jump or call whose targets we
+  // profile. We keep the ORIGINAL address of that jmp/call here because
+  // create_tc2_thread_func() later overwrites instr_map[].orig_ins_addr.
+  indirect_kind_t indirect_kind;
+  ADDRINT indirect_site_addr;
 } bbl_map_t;
 
 bbl_map_t *bbl_map;
@@ -214,6 +227,18 @@ bool isJumpOrRet(INS ins)
      return true;
 
    return false;
+}
+
+// Indirect call: 'call reg' or 'call [mem]'.
+bool isIndirectCall(INS ins)
+{
+   return INS_IsCall(ins) && INS_IsIndirectControlFlow(ins);
+}
+
+// Indirect jump or indirect call (a 'ret' is not included).
+bool isIndirectJumpOrCall(INS ins)
+{
+   return INS_IsIndirectControlFlow(ins) && !INS_IsRet(ins);
 }
 
 bool isBackwardJump(INS ins)
@@ -417,6 +442,36 @@ void dump_profile()
                          static_cast<UINT64>(instr_map[i].orig_ins_addr), 0, 0);
       *out << "0x" << hex << instr_map[i].orig_ins_addr << ": " << disasm_buf <<  endl;
     }
+}
+
+/****************************/
+/*  dump_indirect_profile() */
+/****************************/
+// Print the profiled targets of every indirect jump / indirect call that
+// was executed during the profiling time (enabled by the -dump_prof knob).
+// Must be called after profiling stopped and BEFORE instr_map is rewritten
+// for TC2. It only uses bbl_map (the original site address is saved there).
+// Example output line:
+//   indirect call at 0x4012a0 exec: 1000 | targ 0x401800 count: 990 | targ 0x401900 count: 10
+void dump_indirect_profile()
+{
+    unsigned executed_sites = 0;
+    for (unsigned b = 0; b < bbl_num; b++) {
+      if (bbl_map[b].indirect_kind == NoIndirect || !bbl_map[b].counter)
+        continue;
+      executed_sites++;
+      cerr << (bbl_map[b].indirect_kind == IndirectCall ? "indirect call" : "indirect jump")
+           << " at 0x" << hex << bbl_map[b].indirect_site_addr
+           << " exec: " << dec << bbl_map[b].counter;
+      for (unsigned j = 0; j <= MAX_TARG_ADDRS; j++) {
+        if (!bbl_map[b].targ_count[j])
+          continue;
+        cerr << " | targ 0x" << hex << bbl_map[b].targ_addr[j]
+             << " count: " << dec << bbl_map[b].targ_count[j];
+      }
+      cerr << endl;
+    }
+    cerr << "indirect sites executed during profiling: " << dec << executed_sites << endl;
 }
 
 /**************************/
@@ -699,9 +754,90 @@ int add_new_encoded_instr(ADDRINT ins_addr, xed_encoder_instruction_t *enc_instr
     return 0;
 }
 
+/************************************************/
+/* Indirect jump / indirect call target operand */
+/************************************************/
+// Describes where an indirect jmp/call reads its target address from:
+//   'jmp/call reg'          -> targ_reg
+//   'jmp/call [mem]'        -> base_reg + index_reg*scale + disp
+//   'jmp/call [rip+disp]'   -> the absolute address rip_mem_addr
+typedef struct {
+  xed_reg_enum_t targ_reg;       // XED_REG_INVALID for a memory operand
+  xed_reg_enum_t base_reg;
+  xed_reg_enum_t index_reg;
+  xed_uint_t     scale;
+  xed_int64_t    disp;
+  xed_uint_t     disp_width;
+  unsigned       mem_addr_width;
+  ADDRINT        rip_mem_addr;   // only for base_reg == XED_REG_RIP
+} indirect_target_t;
+
+// Statistics printed after the TC is built.
+unsigned num_prof_indirect_jump_sites = 0;
+unsigned num_prof_indirect_call_sites = 0;
+unsigned num_unsupported_indirect_sites = 0;
+
+// Fill 't' for the indirect jmp/call 'xedd' located at 'ins_addr'.
+// Returns false for forms we do not profile (far jmp/call, FS/GS segment
+// override, non 64-bit operand). Those sites still get their BBL counter,
+// only their targets are not recorded.
+//
+// NOTE: we look at the FIRST EXPLICIT OPERAND to decide register vs.
+// memory. We can NOT use "number of memory operands == 0" like the jump
+// code in bprofile-with-gearing.cpp did, because for a CALL, XED also
+// reports the implicit stack write (the push of the return address) as a
+// memory operand. E.g. 'call rax' has 1 memory operand, [rsp], and using
+// it would record the value at the top of the stack instead of RAX.
+// For 'call [mem]' the target is memory operand 0 and the push is operand 1.
+static bool get_indirect_target_operand(const xed_decoded_inst_t *xedd,
+                                        ADDRINT ins_addr,
+                                        indirect_target_t *t)
+{
+  memset(t, 0, sizeof(*t));
+  t->targ_reg = XED_REG_INVALID;
+  t->base_reg = XED_REG_INVALID;
+  t->index_reg = XED_REG_INVALID;
+
+  xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(xedd);
+  if (iclass != XED_ICLASS_JMP && iclass != XED_ICLASS_CALL_NEAR)
+    return false;                               // e.g. far jmp / far call
+  if (xed_decoded_inst_get_operand_width(xedd) != 64)
+    return false;
+
+  const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+  xed_operand_enum_t op0 = xed_operand_name(xed_inst_operand(xi, 0));
+
+  if (op0 == XED_OPERAND_REG0) {                // jmp/call reg
+    t->targ_reg = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    return true;
+  }
+  if (op0 != XED_OPERAND_MEM0)
+    return false;
+
+  // jmp/call [mem]: the target is memory operand 0.
+  xed_reg_enum_t seg = xed_decoded_inst_get_seg_reg(xedd, 0);
+  if (seg == XED_REG_FS || seg == XED_REG_GS)
+    return false;           // our 'mov rax, [mem]' would miss the segment base
+
+  t->base_reg = xed_decoded_inst_get_base_reg(xedd, 0);
+  t->index_reg = xed_decoded_inst_get_index_reg(xedd, 0);
+  t->scale = xed_decoded_inst_get_scale(xedd, 0);
+  t->disp = xed_decoded_inst_get_memory_displacement(xedd, 0);
+  t->disp_width = xed_decoded_inst_get_memory_displacement_width_bits(xedd, 0);
+  t->mem_addr_width = xed_decoded_inst_get_memop_address_width(xedd, 0);
+  if (t->base_reg == XED_REG_RIP)
+    t->rip_mem_addr = ins_addr + xed_decoded_inst_get_length(xedd) + t->disp;
+  return true;
+}
+
 /**************************/
 /* add_profiling_instrs() */
 /**************************/
+// Adds a profiling stub right before 'ins' (the instruction that ends the
+// BBL), or right after it for the fallthru counter of a cond branch.
+// The stub increments *counter_addr. If 'ins' is an indirect jump or an
+// indirect call, the stub also records the target address in
+// bbl_map[bbl_num].targ_addr[] / targ_count[] (used by de-virtualization).
 int add_profiling_instrs(INS ins, ADDRINT ins_addr,
                          UINT64 *counter_addr, unsigned bbl_num)
 {
@@ -723,47 +859,41 @@ int add_profiling_instrs(INS ins, ADDRINT ins_addr,
   if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
     return -1;
 
-  // Create profiling for indirect jump targets.
-  if (INS_IsIndirectControlFlow(ins) && !INS_IsRet(ins) && !INS_IsCall(ins)) {
+  // Create profiling for indirect jump AND indirect call targets.
+  indirect_target_t t;
+  bool profile_targets = false;
+  if (isIndirectJumpOrCall(ins)) {
+    profile_targets = get_indirect_target_operand(INS_XedDec(ins), ins_addr, &t);
+    if (!profile_targets)
+      num_unsupported_indirect_sites++;
+  }
+
+  if (profile_targets) {
     // Debug print.
-    //cerr << " BBL terminates with indirect jump: "
+    //cerr << " BBL terminates with indirect jump/call: "
     //     << " 0x" << hex << ins_addr << ": "
     //     << INS_Disassemble(ins) << "\n";
+
+    bool is_call = INS_IsCall(ins);
+    bbl_map[bbl_num].indirect_kind = (is_call ? IndirectCall : IndirectJump);
+    bbl_map[bbl_num].indirect_site_addr = ins_addr;
+    if (is_call)
+      num_prof_indirect_call_sites++;
+    else
+      num_prof_indirect_jump_sites++;
 
     static uint64_t rbx_mem = 0;
     static uint64_t rcx_mem = 0;
 
-    // Retrieve the details about the mem operand.
-    xed_decoded_inst_t *xedd = INS_XedDec(ins);
-    xed_reg_enum_t base_reg = xed_decoded_inst_get_base_reg(xedd, 0);
-    xed_reg_enum_t index_reg = xed_decoded_inst_get_index_reg(xedd, 0);
-    xed_int64_t disp = xed_decoded_inst_get_memory_displacement(xedd, 0);
-    xed_uint_t scale = xed_decoded_inst_get_scale(xedd, 0);
-    xed_uint_t width = xed_decoded_inst_get_memory_displacement_width_bits(xedd, 0);
-    unsigned mem_addr_width = xed_decoded_inst_get_memop_address_width(xedd, 0);
-    
-    xed_reg_enum_t targ_reg = XED_REG_INVALID;
-    unsigned memops = xed_decoded_inst_number_of_memory_operands(xedd);
-    if (!memops)
-      targ_reg = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
-
-    // Debug print.
-    //dump_instr_from_xedd(xedd, ins_addr);
-    //cerr << " base reg: " << xed_reg_enum_t2str(base_reg)
-    //     << " index reg " << xed_reg_enum_t2str(index_reg)
-    //     << " scale: " << dec << scale
-    //     << " disp: 0x" << hex << disp
-    //     << " width: " << dec << width
-    //     << " mem addr width: " << dec << mem_addr_width
-    //     << " targ reg: " << targ_reg << xed_reg_enum_t2str(targ_reg)
-    //     << "\n";
-    
+    // The stub (all flags-safe for jmp/call, see the AND below):
+    //
     // save RBX into rbx_mem in 2 steps via RAX
     // save RCX into rcx_mem in 2 steps via RAX
-    // Convert jmp [base_reg + index_reg*scale] to: MOV RAX, [base_reg + index_reg*scale]
-    //         Or convert jmp targ_reg to: MOV RAX, targ_reg ==> RAX holds jump targ addr
+    // Convert jmp/call [base_reg + index_reg*scale] to: MOV RAX, [base_reg + index_reg*scale]
+    //         Or convert jmp/call targ_reg to: MOV RAX, targ_reg ==> RAX holds targ addr
     // MOV RBX, RAX ==> Now RBX also holds targ addr
-    // AND RAX, MAX_TARG_ADDR ==> RAX holds index i = 0..MAX_TARG_ADDRS
+    // MOV RCX, RAX / SHR RCX, 4 / XOR RAX, RCX / AND RAX, MAX_TARG_ADDRS
+    //                              ==> RAX holds slot index i = 0..MAX_TARG_ADDRS
     // MOV RCX, xed_imm0((ADDRINT)&bbl_map_targ_addr[bbl_num][0])
     // MOV [RCX + 8*RAX], RBX
     // MOV RBX, xed_imm0((ADDRINT)&bbl_map_targ_count[bbl_num][0])
@@ -772,6 +902,11 @@ int add_profiling_instrs(INS ins, ADDRINT ins_addr,
     // MOV [RBX + 8*RAX], RCX
     // restore RCX from rcx_mem in 2 steps via RAX
     // restore RBX from rbx_mem in 2 steps via RAX
+    //
+    // Saving RBX/RCX does not modify them, so a target operand that uses
+    // RBX or RCX (e.g. 'call [rbx+0x10]') still sees the original values.
+    // Only RAX was already overwritten, so it is reloaded from rax_mem when
+    // the target operand uses it.
     
     // Save RBX step 1 - MOV RBX into RAX
     xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
@@ -801,44 +936,59 @@ int add_profiling_instrs(INS ins, ADDRINT ins_addr,
     if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
       return -1;
     
-    // Replace RIP reg by an absolute displacement.
-    // Convert 'jmp [rax*8+0x657118]' or: 'jmp [rip+0x42513c]'
-    // to: mov rax, [rax*8+0x657118] or: mov rax, [<absolute addr>]
+    // Load the jump/call target into RAX.
     //
-    // Check if we need to restore RAX in case  it is used as base reg or index reg,
-    // e.g., jmp [RIP+8*RAX] or: jmp [RAX+8*RBX]
-    
-    // Check if we need to restore RAX from rax_mem.
-    if (targ_reg == XED_REG_RAX || base_reg == XED_REG_RAX || index_reg == XED_REG_RAX) {
+    // 1. If the target operand uses RAX (e.g. 'call rax', 'jmp [rax*8+tbl]'),
+    //    first restore the original RAX from rax_mem.
+    if (t.targ_reg == XED_REG_RAX || t.base_reg == XED_REG_RAX || t.index_reg == XED_REG_RAX) {
       xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
                 xed_reg(XED_REG_RAX), // Destination reg op.
                 xed_mem_bd(XED_REG_INVALID, xed_disp((ADDRINT)&rax_mem, 64), 64));
       if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
        return -1;
     }
-    // Check if we need to convert [RIP+disp+index*scale] to [absolute_disp + index*scale]
-    if (base_reg == XED_REG_RIP) {
-      unsigned int orig_size = xed_decoded_inst_get_length (xedd);
-      // Modify rip displacement by an absolute displacement val.
-      xed_int64_t new_disp = ins_addr + disp + orig_size;
+
+    // 2. Read the target.
+    if (t.base_reg == XED_REG_RIP) {
+      // 'jmp/call [rip+disp]': emit 'mov rax, [rip+disp']' and let
+      // fix_rip_displacement() relocate it like any other rip-relative
+      // instr, both in TC and later in TC2. It has 7 bytes
+      // (REX.W 8B 05 disp32), so rip after it = ins_addr + 7.
+      // (bprofile-with-gearing.cpp converted this to an absolute 32-bit
+      // address, which fails for PIE binaries loaded above 2GB.)
+      const unsigned mov_rip_size = 7;
+      xed_int64_t new_disp = (xed_int64_t)t.rip_mem_addr - (xed_int64_t)(ins_addr + mov_rip_size);
       if (new_disp > 0x7FFFFFFF || new_disp < -0x7FFFFFFF) {
-         cerr << "Invalid rip displacement larger than 32 bits in add_profiling_instrs\n";
-         return -1;
+        cerr << "Invalid rip displacement larger than 32 bits in add_profiling_instrs\n";
+        return -1;
       }
-      xed_int64_t new_disp_width = 32; // set maximal disp width for now.
       xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
                 xed_reg(XED_REG_RAX),    // Destination reg op.
-                xed_mem_bisd(XED_REG_INVALID, index_reg, scale, 
-                             xed_disp(new_disp, new_disp_width),
-                             mem_addr_width));
-    } else if (targ_reg != XED_REG_RAX) { // avoid ceating the MOV RAX, RAX Nop.
+                xed_mem_bd(XED_REG_RIP, xed_disp(new_disp, 32), 64));
+      if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
+        return -1;
+      // Sanity check: the new instr must read exactly the same address.
+      if (instr_map[num_of_instr_map_entries - 1].orig_rip_addr != t.rip_mem_addr) {
+        cerr << "ERROR: bad rip-relative target load in add_profiling_instrs at 0x"
+             << hex << ins_addr << endl;
+        return -1;
+      }
+    } else if (t.targ_reg != XED_REG_INVALID) {
+      if (t.targ_reg != XED_REG_RAX) {         // RAX already holds it.
         xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
-                 xed_reg(XED_REG_RAX),    // Destination reg op.
-                 (targ_reg != XED_REG_INVALID ? xed_reg(targ_reg) :
-                  xed_mem_bisd(base_reg, index_reg, scale, xed_disp(disp, width), mem_addr_width)));
+                  xed_reg(XED_REG_RAX),        // Destination reg op.
+                  xed_reg(t.targ_reg));
+        if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
+          return -1;
+      }
+    } else {
+      xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                xed_reg(XED_REG_RAX),          // Destination reg op.
+                xed_mem_bisd(t.base_reg, t.index_reg, t.scale,
+                             xed_disp(t.disp, t.disp_width), t.mem_addr_width));
+      if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
+        return -1;
     }
-    if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
-      return -1;
     
     // MOV RBX, RAX
     xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
@@ -846,14 +996,46 @@ int add_profiling_instrs(INS ins, ADDRINT ins_addr,
               xed_reg(XED_REG_RAX));
     if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
       return -1;
-    
+
+    // Pick the slot for this target:  slot = (targ ^ (targ >> 4)) & MAX_TARG_ADDRS
+    //
+    // bprofile-with-gearing.cpp used slot = targ & MAX_TARG_ADDRS (the 2 low
+    // bits). Function entries are usually 16-byte aligned, so every target
+    // of an indirect CALL has low bits 00 and all of them would share slot 0.
+    // Mixing in bits 4-5 spreads aligned function entries over the slots,
+    // while jump-table case labels (any alignment) still differ in bits 0-1.
+    // Two targets can still share a slot. The slot then keeps the LAST
+    // target seen and the SUM of the counts, so it is a hint. That is fine
+    // for de-virtualization, which always compares the real target against
+    // the predicted one at run time.
+    // (SHR, XOR and AND modify RFLAGS, like the AND in the original stub.
+    // That is safe: the next instr is an indirect jmp/call, which does not
+    // read the flags, and the ABI does not pass flags to a called function.)
+    xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+              xed_reg(XED_REG_RCX),    // Destination reg op.
+              xed_reg(XED_REG_RAX));
+    if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
+      return -1;
+
+    xed_inst2(&enc_instr, dstate, XED_ICLASS_SHR, 64,
+              xed_reg(XED_REG_RCX),    // Destination reg op.
+              xed_imm0(4, 8));
+    if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
+      return -1;
+
+    xed_inst2(&enc_instr, dstate, XED_ICLASS_XOR, 64,
+              xed_reg(XED_REG_RAX),    // Destination reg op.
+              xed_reg(XED_REG_RCX));
+    if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
+      return -1;
+
     // AND RAX, MAX_TARG_ADDRS. (NOTE: Modifies RFLAGS).
     xed_inst2(&enc_instr, dstate, XED_ICLASS_AND, 64,
               xed_reg(XED_REG_RAX),    // Destination reg op.
               xed_imm0(MAX_TARG_ADDRS, 8));  // keep only MAX_TARG_ADDRS+1 targets for profiling.
     if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
       return -1;
-    
+
     // MOV RCX, xed_imm0((ADDRINT)&bbl_map[bbl_num].targ_addr[0])
     xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
               xed_reg(XED_REG_RCX), // Destination reg op.
@@ -938,7 +1120,7 @@ int add_profiling_instrs(INS ins, ADDRINT ins_addr,
     if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
       return -1;
 
-  } // end of: 'if bbl terminates with indirect jump'.
+  } // end of: 'if bbl terminates with indirect jump or call'.
   
   // Create the profiling instrs for counting the BBL frequency.
   //
@@ -1457,10 +1639,15 @@ int find_candidate_rtns_for_tc(IMG img)
 
                 // Check if ins is a control transfer instr that terminates a BBL
                 // or the next instr is a target of a direct branch or call.
+                // An indirect call also terminates a BBL, so that the BBL's
+                // profiling stub (placed right before it) records the call
+                // targets in that BBL's own targ_addr[]/targ_count[] slots.
+                // Direct calls do not end a BBL (their target is known).
                 INS next_ins = INS_Next(ins);
-                bool isNextInsJumpTarget = 
+                bool isNextInsJumpTarget =
                     (!INS_Valid(next_ins) ? false : is_targ_map[INS_Address(next_ins)]);
-                bool isInsTerminatesBBL = (isJumpOrRet(ins) || isNextInsJumpTarget);
+                bool isInsTerminatesBBL = (isJumpOrRet(ins) || isIndirectCall(ins) ||
+                                           isNextInsJumpTarget);
 
                 // Add profiling instructions to count each BBL exec at runtime:
                 //
@@ -1694,6 +1881,10 @@ void create_tc2_thread_func(void *v)
     int rc = disable_profiling_in_tc(instr_map, num_of_instr_map_entries);
     if  (rc < 0)
       return;
+
+    // Print the indirect jump/call target profile (debug, -dump_prof).
+    if (KnobDumpProfile)
+      dump_indirect_profile();
 
 	// Step 1: Modify instr_map to be used for TC2.
     //
@@ -1994,6 +2185,10 @@ VOID create_tc(IMG img, VOID *v)
         return;
     }
     cerr << "after identifying candidate routines" << endl;
+    cerr << " indirect target profiling: " << dec << num_prof_indirect_jump_sites
+         << " jump sites, " << num_prof_indirect_call_sites << " call sites"
+         << " (" << num_unsupported_indirect_sites << " unsupported sites not profiled)"
+         << endl;
 
     // Step 3: Chaining - calculate direct branch and call instructions to point
     //         to corresponding target instr entries:
