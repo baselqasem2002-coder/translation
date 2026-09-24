@@ -26,7 +26,7 @@ static char *build(const unsigned char *bytes, unsigned len, ADDRINT fake_addr)
   xed_decoded_inst_zero_set_mode(&mi.xedd, &dstate);
   if (xed_decode(&mi.xedd, bytes, len) != XED_ERROR_NONE) { printf("decode failed\n"); exit(1); }
   mi.addr = fake_addr;
-  if (add_profiling_instrs(&mi, fake_addr, &bbl_map[0].counter, 0) < 0) { printf("stub failed\n"); exit(1); }
+  if (add_profiling_instrs(&mi, fake_addr, &bbl_map[0].counter, 0, false) < 0) { printf("stub failed\n"); exit(1); }
   xed_decoded_inst_t x; xed_decoded_inst_zero_set_mode(&x, &dstate); xed_decode(&x, bytes, len);
   if (add_new_instr_entry(&x, fake_addr, RegularIns) < 0) exit(1);
   unsigned char ret_b[] = {0xC3};

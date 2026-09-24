@@ -37,6 +37,7 @@ int main()
 {
   setvbuf(stdout, 0, _IONBF, 0);
   xed_tables_init();
+  min_rtn_size_for_translation = 1;   // the test routines are smaller than 16 bytes
 
   char *orig = (char *)mmap((void *)0x10000000, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);

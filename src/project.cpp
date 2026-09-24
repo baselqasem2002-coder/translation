@@ -54,6 +54,12 @@ END_LEGAL */
  * in TC to its correspoding NOP7 header instruction in the TC2.
  *
  * Finally, on exit, the profiling data is then printed into the output file bprofile.out.
+ *
+ * Merged from our exercise 4 (marked "EX4" in the code): routine filters,
+ * revert of a routine that fails to translate, safe probe commits, jcc to
+ * original code, the jump_to_orig_addr_map off-by-one fix, a bounded and
+ * single-store disable_profiling_in_tc(), waiting for the TC before counting
+ * prof_time, and the dead-register (RAX) optimization of the profiling stubs.
  */
 
 #include "pin.H"
@@ -119,6 +125,9 @@ KNOB<BOOL> KnobNoDevirt(KNOB_MODE_WRITEONCE,    "pintool",
 
 KNOB<BOOL> KnobNoReorder(KNOB_MODE_WRITEONCE,    "pintool",
     "no_reorder", "0", "Do not apply code reordering in TC2");
+
+KNOB<BOOL> KnobNoDeadRegOpt(KNOB_MODE_WRITEONCE,    "pintool",
+    "no_deadreg", "0", "Disable the dead-register save/restore optimization of the profiling stubs");
 
 
 /* ===================================================================== */
@@ -214,6 +223,14 @@ std::map<ADDRINT, unsigned> entry_map;
 
 unsigned max_rtn_count = 0;
 
+// Capacity (number of entries) of bbl_map and of jump_to_orig_addr_map.
+unsigned max_bbl_count = 0;
+unsigned max_jump_to_orig_addr_count = 0;
+
+// EX4: state of the TC, read by the TC2 thread before it starts counting
+// -prof_time: 0 = not built yet, 1 = built and committed, -1 = failed.
+volatile INT32 tc_state = 0;
+
 struct timespec start_running_time;
 struct timespec end_running_time;
 
@@ -250,6 +267,111 @@ bool isIndirectCall(INS ins)
 bool isIndirectJumpOrCall(INS ins)
 {
    return INS_IsIndirectControlFlow(ins) && !INS_IsRet(ins);
+}
+
+/* ============================================================= */
+/* EX4: Safety filters for Probe-mode translation                */
+/* ============================================================= */
+static bool StartsWith(const string& s, const string& prefix)
+{
+    return s.compare(0, prefix.size(), prefix) == 0;
+}
+
+// Routines that must not be translated (libc/startup internals, syscall
+// wrappers, and a few cc1 routines found to break under translation).
+static bool ShouldSkipRoutineByName(const string& name)
+{
+    static const char* exact_skip[] = {
+        "_init", "_start", "_fini",
+        "deregister_tm_clones", "register_tm_clones",
+        "__do_global_dtors_aux", "frame_dummy",
+        "__libc_csu_init", "__libc_csu_fini",
+        "_exit", "exit", "abort",
+        "open", "open64", "__open", "__open64", "openat", "__openat",
+        "close", "__close", "read", "__read", "write", "__write",
+        "lseek", "lseek64", "__lseek", "__lseek64",
+        "stat", "stat64", "lstat", "lstat64", "fstat", "fstat64",
+        "__xstat", "__lxstat", "__fxstat", "__fxstat64",
+        "__fxstatat", "__fxstatat64", "isatty", "uname",
+        "mmap", "mmap64", "munmap", "mprotect", "brk", "sbrk",
+        "malloc", "free", "calloc", "realloc",
+        "fopen", "fopen64", "fclose", "fread", "fwrite", "fflush",
+        "fseek", "ftell", "fseeko", "ftello",
+        "memcpy", "memmove", "memset", "strlen", "strcmp", "strncmp",
+        "strcpy", "strncpy",
+        "bitmap_clear_range",
+        "bitmap_intersect_compl_p",
+        "fold_ignored_result.part.0",
+        "strip_invariant_refs",
+        "get_base_address",
+        "gt_pch_nx_section",
+        "gt_pch_nx_cpp_token",
+        "init_object_sizes.part.0",
+        "fini_object_sizes",
+        "type_internals_preclude_sra_p",
+        "decBiStr",
+        "trim_filename",
+        "tree_log2"
+    };
+
+    for (unsigned i = 0; i < sizeof(exact_skip) / sizeof(exact_skip[0]); i++) {
+        if (name == exact_skip[i])
+            return true;
+    }
+
+    if (StartsWith(name, "_dl_"))
+        return true;
+    if (StartsWith(name, "_IO_"))
+        return true;
+    if (StartsWith(name, "__libc_"))
+        return true;
+    if (StartsWith(name, "__GI_"))
+        return true;
+    if (StartsWith(name, "_Unwind_"))
+        return true;
+    if (name.find("syscall") != string::npos)
+        return true;
+    if (name.find("freeres") != string::npos)
+        return true;
+
+   return false;
+}
+
+// Routines smaller than this are not translated.
+unsigned min_rtn_size_for_translation = 16;
+
+// EX4: is 'rtn' a candidate for translation? Skips the routines above, PLT
+// stubs, routines Pin cannot probe safely, tiny routines, and routines that
+// start inside the previous selected routine (duplicate symbols for the same
+// code would corrupt the address-based chaining).
+static bool IsCandidateRtnForTranslation(RTN rtn, ADDRINT& last_selected_rtn_end)
+{
+   if (!RTN_Valid(rtn))
+       return false;
+
+   string rtn_name = RTN_Name(rtn);
+
+   if (ShouldSkipRoutineByName(rtn_name))
+       return false;
+
+   if (rtn_name.find(".plt") != string::npos ||
+       rtn_name.find("@plt") != string::npos)
+       return false;
+
+   if (!RTN_IsSafeForProbedReplacement(rtn))
+       return false;
+
+   ADDRINT rtn_addr = RTN_Address(rtn);
+   USIZE rtn_size = RTN_Size(rtn);
+
+   if (rtn_size < min_rtn_size_for_translation)
+       return false;
+
+   if (last_selected_rtn_end != 0 && rtn_addr < last_selected_rtn_end)
+       return false;
+
+   last_selected_rtn_end = rtn_addr + rtn_size;
+   return true;
 }
 
 bool isBackwardJump(INS ins)
@@ -609,9 +731,11 @@ int disable_profiling_in_tc(instr_map_t * instr_map, unsigned num_of_instr_map_e
         if (instr_map[i].ins_type == ProfilingIns &&
             instr_map[i].xed_category == XED_CATEGORY_WIDENOP) {
             // Calculate the jump displacement.
+            // (EX4: bounded, so the scan cannot run past the end of instr_map.)
             unsigned j = 1;
             xed_int64_t disp = 0;
-            while (instr_map[i+j].ins_type == ProfilingIns) {
+            while (i + j < num_of_instr_map_entries &&
+                   instr_map[i+j].ins_type == ProfilingIns) {
                 disp += instr_map[i+j].size;
                 j++;
             }
@@ -645,7 +769,20 @@ int disable_profiling_in_tc(instr_map_t * instr_map, unsigned num_of_instr_map_e
           }
 
           // Write the bypassing jump instr on the NOP instr.
-          memcpy((ADDRINT *)instr_map[i].new_ins_addr, encoded_jmp_ins, olen);
+          // EX4: check the address, then write the 5 jump bytes together with
+          // the 3 bytes after them as ONE 8-byte store, so that a thread running
+          // this code sees either the old NOP or the new jmp (the original
+          // memcpy wrote byte by byte).
+          const ADDRINT patch_addr = instr_map[i].new_ins_addr;
+          if (patch_addr < (ADDRINT)tc || patch_addr + sizeof(UINT64) > (ADDRINT)tc + max_tc_size) {
+              continue;
+          }
+          UINT64 patch_word = 0;
+          memcpy(&patch_word, reinterpret_cast<const void *>(patch_addr), sizeof(patch_word));
+          memcpy(&patch_word, encoded_jmp_ins, olen);
+          __sync_synchronize();
+          *reinterpret_cast<volatile UINT64 *>(patch_addr) = patch_word;
+          __sync_synchronize();
           i += (j - 1);
        }
     }
@@ -682,6 +819,21 @@ int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, ins_enum_t ins_typ
       }
     }
 
+    // Make room for the new entry: grow instr_map when it is full.
+    // (The original code failed with "out of memory for map_instr" once the
+    // size estimate of allocate_and_init_memory() was exceeded.)
+    if (num_of_instr_map_entries + 1 >= max_ins_count) {
+        unsigned new_capacity = max_ins_count ? max_ins_count * 2 : 1024;
+        void *new_map = realloc(instr_map, (size_t)new_capacity * sizeof(instr_map_t));
+        if (new_map == NULL) {
+            perror("realloc instr_map");
+            return -1;
+        }
+        instr_map = (instr_map_t *)new_map;
+        memset(instr_map + max_ins_count, 0, (size_t)(new_capacity - max_ins_count) * sizeof(instr_map_t));
+        max_ins_count = new_capacity;
+    }
+
     // Converts the decoder request to a valid encoder request:
     xed_encoder_request_init_from_decode (xedd);
 
@@ -708,11 +860,6 @@ int add_new_instr_entry(xed_decoded_inst_t *xedd, ADDRINT pc, ins_enum_t ins_typ
     instr_map[num_of_instr_map_entries].xed_category = xed_decoded_inst_get_category(xedd);
 
     num_of_instr_map_entries++;
-
-    if (num_of_instr_map_entries >= max_ins_count) {
-        cerr << "out of memory for map_instr" << endl;
-        return -1;
-    }
 
     // debug print new encoded instr:
     if (KnobVerbose) {
@@ -763,6 +910,117 @@ int add_new_encoded_instr(ADDRINT ins_addr, xed_encoder_instruction_t *enc_instr
       return -1;
     }
     return 0;
+}
+
+/* ============================================================= */
+/* EX4: Register liveness for the dead-register optimization     */
+/* ============================================================= */
+// A profiling stub saves RAX before using it and restores it afterwards.
+// When RAX is provably DEAD at the stub (it is overwritten before it is read
+// on every path from there), the save and restore are not emitted.
+
+unsigned long g_num_bbl_stubs        = 0;
+unsigned long g_num_rax_save_skipped = 0;
+
+// True if 'ins' reads any sub-register/alias of 'reg' (EAX/AX/AL count as RAX).
+bool instructionReadsReg(INS ins, REG reg)
+{
+    REG full = REG_FullRegName(reg);
+    UINT32 n = INS_MaxNumRRegs(ins);
+    for (UINT32 i = 0; i < n; i++) {
+        if (REG_FullRegName(INS_RegR(ins, i)) == full)
+            return true;
+    }
+    return false;
+}
+
+// True if 'ins' performs a *killing* (full) write of 'reg'. On x86-64 a 64-bit
+// or 32-bit destination fully defines the 64-bit register (32-bit writes
+// zero-extend); writes to 16/8-bit sub-registers are partial and do NOT kill.
+bool instructionFullyWritesReg(INS ins, REG reg)
+{
+    REG full = REG_FullRegName(reg);
+    UINT32 n = INS_MaxNumWRegs(ins);
+    for (UINT32 i = 0; i < n; i++) {
+        REG w = INS_RegW(ins, i);
+        if (REG_FullRegName(w) == full && REG_Size(w) >= 4)
+            return true;
+    }
+    return false;
+}
+
+// True if 'ins' reads or writes any alias of 'reg'.
+bool instructionReadsOrWritesReg(INS ins, REG reg)
+{
+    if (instructionReadsReg(ins, reg))
+        return true;
+    REG full = REG_FullRegName(reg);
+    UINT32 n = INS_MaxNumWRegs(ins);
+    for (UINT32 i = 0; i < n; i++) {
+        if (REG_FullRegName(INS_RegW(ins, i)) == full)
+            return true;
+    }
+    return false;
+}
+
+// We cannot safely continue a straight-line liveness scan past a control
+// transfer (we would not know which successor actually executes).
+bool isLivenessBarrier(INS ins)
+{
+    return INS_IsDirectControlFlow(ins)   ||
+           INS_IsIndirectControlFlow(ins) ||
+           INS_IsRet(ins)                 ||
+           INS_IsCall(ins)                ||
+           INS_IsSyscall(ins);
+}
+
+// Conservative deadness test: is 'reg' dead on the guaranteed straight-line
+// path that begins at instruction 'start'?
+bool regIsDeadFrom(INS start, REG reg)
+{
+    INS cur = start;
+    int  steps = 0;
+    const int MAX_STEPS = 128;
+    while (INS_Valid(cur) && steps < MAX_STEPS) {
+        if (instructionReadsReg(cur, reg))
+            return false;                   // used -> live
+        if (INS_IsPredicated(cur) && instructionReadsOrWritesReg(cur, reg))
+            return false;                   // conditional def does not kill -> live
+        if (instructionFullyWritesReg(cur, reg))
+            return true;                    // unconditional full redefine -> dead
+        if (isLivenessBarrier(cur))
+            return false;                   // unknown successor -> live
+        cur = INS_Next(cur);
+        steps++;
+    }
+    return false;                           // routine boundary / scan limit -> live
+}
+
+// Successor-aware RAX deadness for a DIRECT CONDITIONAL branch terminator:
+// RAX is dead before the branch if it is dead on BOTH successors.
+bool raxDeadOnBothCondBranchSuccessors(INS cond_branch_ins,
+                                       const std::map<ADDRINT, INS>& addr2ins)
+{
+    if (INS_Category(cond_branch_ins) != XED_CATEGORY_COND_BR)
+        return false;
+    if (!INS_IsDirectControlFlow(cond_branch_ins))
+        return false;
+
+    // Fall-through successor must exist.
+    INS fallthru_ins = INS_Next(cond_branch_ins);
+    if (!INS_Valid(fallthru_ins))
+        return false;
+
+    // Taken target must map to an instruction in the same (open) routine.
+    ADDRINT targ_addr = INS_DirectControlFlowTargetAddress(cond_branch_ins);
+    std::map<ADDRINT, INS>::const_iterator it = addr2ins.find(targ_addr);
+    if (it == addr2ins.end())
+        return false;
+    INS taken_ins = it->second;
+
+    // RAX must be provably dead on BOTH paths.
+    return regIsDeadFrom(taken_ins,    LEVEL_BASE::REG_RAX) &&
+           regIsDeadFrom(fallthru_ins, LEVEL_BASE::REG_RAX);
 }
 
 /************************************************/
@@ -850,25 +1108,12 @@ static bool get_indirect_target_operand(const xed_decoded_inst_t *xedd,
 // indirect call, the stub also records the target address in
 // bbl_map[bbl_num].targ_addr[] / targ_count[] (used by de-virtualization).
 int add_profiling_instrs(INS ins, ADDRINT ins_addr,
-                         UINT64 *counter_addr, unsigned bbl_num)
+                         UINT64 *counter_addr, unsigned bbl_num,
+                         bool rax_is_dead)
 {
   xed_encoder_instruction_t enc_instr;
 
   static uint64_t rax_mem = 0;
-  
-  // Add NOP instr (to be overwritten later on by a jmp that skips
-  // the profiling, once profiling is done).
-  xed_inst0(&enc_instr, dstate, XED_ICLASS_NOP4, 64);
-  if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
-    return -1;
-
-  // Save RAX:
-  // MOV RAX into rax_mem
-  xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
-            xed_mem_bd(XED_REG_INVALID, xed_disp((ADDRINT)&rax_mem, 64), 64), // Destination op.
-            xed_reg(XED_REG_RAX));
-  if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
-    return -1;
 
   // Create profiling for indirect jump AND indirect call targets.
   indirect_target_t t;
@@ -877,6 +1122,29 @@ int add_profiling_instrs(INS ins, ADDRINT ins_addr,
     profile_targets = get_indirect_target_operand(INS_XedDec(ins), ins_addr, &t);
     if (!profile_targets)
       num_unsupported_indirect_sites++;
+  }
+  // EX4: the target-recording code below uses RAX internally and reloads the
+  // application's RAX from rax_mem, so RAX is always saved at those sites.
+  if (profile_targets)
+    rax_is_dead = false;
+  g_num_bbl_stubs++;
+  
+  // Add NOP instr (to be overwritten later on by a jmp that skips
+  // the profiling, once profiling is done).
+  xed_inst0(&enc_instr, dstate, XED_ICLASS_NOP4, 64);
+  if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
+    return -1;
+
+  // Save RAX (EX4: skipped when RAX is dead at the stub):
+  // MOV RAX into rax_mem
+  if (!rax_is_dead) {
+    xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+              xed_mem_bd(XED_REG_INVALID, xed_disp((ADDRINT)&rax_mem, 64), 64), // Destination op.
+              xed_reg(XED_REG_RAX));
+    if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
+      return -1;
+  } else {
+    g_num_rax_save_skipped++;
   }
 
   if (profile_targets) {
@@ -1157,13 +1425,15 @@ int add_profiling_instrs(INS ins, ADDRINT ins_addr,
   if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
     return -1;
 
-  // Restore RAX:
+  // Restore RAX (EX4: skipped when RAX is dead at the stub):
   // MOV from rax_mem into RAX
-  xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
-            xed_reg(XED_REG_RAX), // Destination reg op.
-            xed_mem_bd(XED_REG_INVALID, xed_disp((ADDRINT)&rax_mem, 64), 64));
-  if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
-    return -1;
+  if (!rax_is_dead) {
+    xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+              xed_reg(XED_REG_RAX), // Destination reg op.
+              xed_mem_bd(XED_REG_INVALID, xed_disp((ADDRINT)&rax_mem, 64), 64));
+    if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0)
+      return -1;
+  }
  
   return 0;
 }
@@ -1300,16 +1570,23 @@ int fix_rip_displacement(unsigned instr_map_entry)
 /**************************************/
 /* fix_direct_jmp_or_call_to_orig_addr */
 /**************************************/
+// Index of each original target address in jump_to_orig_addr_map
+// (a map instead of the linear search of the original code).
+std::map<ADDRINT, unsigned> jump_to_orig_addr_index;
+
 int fix_direct_jmp_or_call_to_orig_addr(unsigned instr_map_entry)
 {
     // Ignore instructions of zero size.
     if (!instr_map[instr_map_entry].size)
       return 0;
 
-    // Debug print.
-    cerr << "jump to orig addr: 0x" << hex << instr_map[instr_map_entry].orig_targ_addr << " : ";
-    dump_instr_from_mem ((ADDRINT *)instr_map[instr_map_entry].encoded_ins,
-                         instr_map[instr_map_entry].orig_ins_addr);
+    // Debug print (EX4: only with -verbose; printing every such branch
+    // slowed down the start of large binaries).
+    if (KnobVerbose) {
+      cerr << "jump to orig addr: 0x" << hex << instr_map[instr_map_entry].orig_targ_addr << " : ";
+      dump_instr_from_mem ((ADDRINT *)instr_map[instr_map_entry].encoded_ins,
+                           instr_map[instr_map_entry].orig_ins_addr);
+    }
 
     // check for cases of direct jumps/calls back to the orginal target address:
     if (instr_map[instr_map_entry].targ_map_entry >= 0) {
@@ -1330,6 +1607,52 @@ int fix_direct_jmp_or_call_to_orig_addr(unsigned instr_map_entry)
 
     xed_category_enum_t category_enum = xed_decoded_inst_get_category(&xedd);
 
+    // EX4: a conditional branch to original code (e.g. a jcc to a routine
+    // that is not translated) keeps a direct rel32 displacement to the
+    // original address (the TC is allocated within 2GB of the code).
+    if (category_enum == XED_CATEGORY_COND_BR) {
+        xed_int64_t new_disp =
+            (xed_int64_t)(instr_map[instr_map_entry].orig_targ_addr -
+                         instr_map[instr_map_entry].new_ins_addr -
+                         instr_map[instr_map_entry].size);
+
+        xed_iclass_enum_t iclass_enum = xed_decoded_inst_get_iclass(&xedd);
+        xed_iform_enum_t iform_enum = xed_decoded_inst_get_iform_enum(&xedd);
+        xed_uint_t new_disp_byts = 4;
+
+        if (iclass_enum == XED_ICLASS_LOOP ||
+            iclass_enum == XED_ICLASS_LOOPE ||
+            iclass_enum == XED_ICLASS_LOOPNE ||
+            iform_enum == XED_IFORM_JRCXZ_RELBRb) {
+            if (new_disp > 127 || new_disp < -128) {
+                cerr << "Invalid 8-bit displacement for loop/jrcxz to original code\n";
+                dump_instr_map_entry(instr_map_entry);
+                return -1;
+            }
+            new_disp_byts = 1;
+        } else if (new_disp > 0x7FFFFFFF || new_disp < -0x7FFFFFFF) {
+            cerr << "Invalid conditional branch displacement larger than 32 bits\n";
+            dump_instr_map_entry(instr_map_entry);
+            return -1;
+        }
+
+        unsigned max_size = XED_MAX_INSTRUCTION_BYTES;
+        unsigned new_size = 0;
+
+        xed_encoder_request_init_from_decode(&xedd);
+        xed_encoder_request_set_branch_displacement(&xedd, new_disp, new_disp_byts);
+
+        xed_error_enum_t xed_error =
+            xed_encode(&xedd, reinterpret_cast<UINT8*>(instr_map[instr_map_entry].encoded_ins),
+                       max_size, &new_size);
+        if (xed_error != XED_ERROR_NONE) {
+            cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
+            dump_instr_map_entry(instr_map_entry);
+            return -1;
+        }
+        return new_size;
+    }
+
     if (category_enum != XED_CATEGORY_CALL && category_enum != XED_CATEGORY_UNCOND_BR) {
         cerr << "ERROR: Invalid direct jump from translated code to original code for:\n";
         dump_instr_map_entry(instr_map_entry);
@@ -1346,26 +1669,32 @@ int fix_direct_jmp_or_call_to_orig_addr(unsigned instr_map_entry)
     // and indirectly jmp/call via that memory location.
 
     // search for orig_targ_addr in jump_to_orig_addr_map.
-    int jump_to_orig_addr_map_entry = -1;
-    for (unsigned i = 0; i < jump_to_orig_addr_num; i++) {
-      if (instr_map[instr_map_entry].orig_targ_addr == jump_to_orig_addr_map[i]) {
-        jump_to_orig_addr_map_entry = i;
-        break;
-      }
-    }
-    if (jump_to_orig_addr_map_entry < 0) {
-      jump_to_orig_addr_num++;
+    ADDRINT orig_targ_addr = instr_map[instr_map_entry].orig_targ_addr;
+    unsigned jump_to_orig_addr_map_entry;
+    std::map<ADDRINT, unsigned>::iterator it = jump_to_orig_addr_index.find(orig_targ_addr);
+    if (it != jump_to_orig_addr_index.end()) {
+      jump_to_orig_addr_map_entry = it->second;
+    } else {
+      // EX4 fix: use the current count as the new slot and THEN increment it.
+      // (The original incremented first, so slot 0 was never used and each new
+      // entry was written one slot past the range the lookup scanned.)
       jump_to_orig_addr_map_entry = jump_to_orig_addr_num;
-      if ((unsigned)jump_to_orig_addr_map_entry >= max_rtn_count) {
+      if (jump_to_orig_addr_map_entry >= max_jump_to_orig_addr_count) {
          cerr << "exceeded size of jump_to_orig_addr_map at fix_direct_jmp_or_call_to_orig_addr\n";
          return -1;
       }
-      jump_to_orig_addr_map[jump_to_orig_addr_map_entry] = instr_map[instr_map_entry].orig_targ_addr;
+      jump_to_orig_addr_num++;
+      jump_to_orig_addr_map[jump_to_orig_addr_map_entry] = orig_targ_addr;
+      jump_to_orig_addr_index[orig_targ_addr] = jump_to_orig_addr_map_entry;
     }
 
+    // EX4: the new 'jmp/call qword ptr [rip+disp32]' is 6 bytes long, so rip
+    // after it is new_ins_addr + 6 (the original used the length of the old
+    // direct jmp/call and only became correct in a later fixing pass).
+    const xed_uint_t indirect_jmp_call_size = 6;
     xed_int64_t new_disp = (ADDRINT)&jump_to_orig_addr_map[jump_to_orig_addr_map_entry] -
                        instr_map[instr_map_entry].new_ins_addr -
-                       xed_decoded_inst_get_length (&xedd);
+                       indirect_jmp_call_size;
     if (new_disp > 0x7FFFFFFF || new_disp < -0x7FFFFFFF) {
         cerr << "Invalid rip displacement larger than 32 bits in fix_direct_jmp_or_call_to_orig_addr\n";
         cerr << "new displacement: " << dec << new_disp << "\n";
@@ -1576,13 +1905,152 @@ int fix_instructions_displacements()
  }
 
 
+/***********************************/
+/* translate_rtn_into_instr_map()  */
+/***********************************/
+// Adds the instructions of the (open) routine 'rtn' to instr_map, with the
+// profiling stubs. Returns 0, or -1 if the routine cannot be translated
+// (the caller then removes what was added for it).
+static int translate_rtn_into_instr_map(RTN rtn)
+{
+    int rc = 0;
+
+    // Map all instructions that are a target of some direct jump or call in the rtn.
+    // EX4: also map address -> INS for the successor-aware liveness rule.
+    std::map<ADDRINT, bool> is_targ_map;
+    std::map<ADDRINT, INS> addr2ins;
+    for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins)) {
+       addr2ins[INS_Address(ins)] = ins;
+       if (INS_IsDirectControlFlow(ins)) {
+         ADDRINT targ_addr = INS_DirectControlFlowTargetAddress(ins);
+         is_targ_map[targ_addr] = true;
+       }
+    }
+
+    for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins)) {
+
+        //debug print of orig instruction:
+        if (KnobVerbose) {
+            cerr << "old instr: ";
+            cerr << "0x" << hex << INS_Address(ins) << ": " << INS_Disassemble(ins) <<  endl;
+            //xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));
+        }
+
+        ADDRINT ins_addr = INS_Address(ins);
+
+        xed_decoded_inst_t xedd;
+        xed_error_enum_t xed_code;
+
+        // Add instr into instr map:
+        bool isRtnHeadIns = (RTN_Address(rtn) == ins_addr);
+        ins_enum_t ins_type = (isRtnHeadIns ? RtnHeadIns : RegularIns);
+
+        // Insert a NOP7 instr at Rtn Head to be used in order
+        // to restore orig target of a cond jumps to a routine.
+        //
+        if (!KnobNoProfile && isRtnHeadIns) {
+          rc = create_nop7_xedd_instr(&xedd);
+          if (rc < 0) {
+            cerr << "ERROR: failed to create a NOP7 instr during translation of instr at: "
+                 << "0x" << hex << ins_addr << endl;
+            return -1;
+          }
+          rc = add_new_instr_entry(&xedd, ins_addr, ins_type);
+          if (rc < 0) {
+            cerr << "ERROR: failed during instructon translation." << endl;
+            return -1;
+          }
+          ins_type = RegularIns;
+        }
+
+        // Check if ins is a control transfer instr that terminates a BBL
+        // or the next instr is a target of a direct branch or call.
+        // An indirect call also terminates a BBL, so that the BBL's
+        // profiling stub (placed right before it) records the call
+        // targets in that BBL's own targ_addr[]/targ_count[] slots.
+        // Direct calls do not end a BBL (their target is known).
+        INS next_ins = INS_Next(ins);
+        bool isNextInsJumpTarget = 
+            (!INS_Valid(next_ins) ? false : is_targ_map[INS_Address(next_ins)]);
+        bool isInsTerminatesBBL = (isJumpOrRet(ins) || isIndirectCall(ins) ||
+                                   isNextInsJumpTarget);
+
+        // Add profiling instructions to count each BBL exec at runtime:
+        //
+        if (!KnobNoProfile && isInsTerminatesBBL) {
+          // EX4: RAX deadness is evaluated at the stub, i.e. right before 'ins'.
+          bool rax_dead = false;
+          if (!KnobNoDeadRegOpt) {
+            rax_dead = regIsDeadFrom(ins, LEVEL_BASE::REG_RAX) ||
+                       raxDeadOnBothCondBranchSuccessors(ins, addr2ins);
+          }
+          rc = add_profiling_instrs(ins, ins_addr, &bbl_map[bbl_num].counter, bbl_num, rax_dead);
+          if (rc < 0)
+            return -1;
+        }
+  
+        // Add ins to instr_map:
+        //
+        xed_decoded_inst_zero_set_mode(&xedd,&dstate);
+        xed_code = xed_decode(&xedd, reinterpret_cast<UINT8*>(ins_addr), max_inst_len);
+        if (xed_code != XED_ERROR_NONE) {
+            cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << ins_addr << endl;
+            return -1;
+        }
+
+        // Add the instr into the instr_map table.
+        rc = add_new_instr_entry(&xedd, INS_Address(ins), ins_type);
+        if (rc < 0) {
+            cerr << "ERROR: failed during instructon translation." << endl;
+            return -1;
+        }
+
+        if (isInsTerminatesBBL) {
+          if (bbl_num + 2 >= max_bbl_count) {
+            cerr << "ERROR: out of memory for bbl_map" << endl;
+            return -1;
+          }
+          bbl_map[bbl_num].terminating_ins_entry = num_of_instr_map_entries - 1;
+          bbl_num++;
+          bbl_map[bbl_num].starting_ins_entry = num_of_instr_map_entries;
+        }
+
+        // Apply edge Profiling: For BBLs that end with a conditional branch,
+        //     insert an increment of the fallthrough counter for this BBL,
+        //     immediately after the cond branch which terminates the bbl.
+        //     and before the next BBL.
+        if (!KnobNoProfile && INS_Category(ins) == XED_CATEGORY_COND_BR) {
+          // EX4: this stub runs on the fall-through path, right before the
+          // next instr, so RAX deadness is evaluated from there.
+          INS fallthru_ins = INS_Next(ins);
+          bool rax_dead = (!KnobNoDeadRegOpt && INS_Valid(fallthru_ins))
+                          ? regIsDeadFrom(fallthru_ins, LEVEL_BASE::REG_RAX) : false;
+          rc = add_profiling_instrs(ins, ins_addr,
+                                    &bbl_map[bbl_num - 1].fallthru_counter, bbl_num-1,
+                                    rax_dead);
+          if (rc < 0)
+            return -1;
+        }
+
+    } // end for INS...
+
+    // debug print of routine name:
+    if (KnobVerbose) {
+        cerr <<   "rtn name: " << RTN_Name(rtn) << endl;
+    }
+    return 0;
+}
+
 /********************************/
 /* find_candidate_rtns_for_tc() */
 /********************************/
+unsigned num_translated_rtns = 0;
+unsigned num_reverted_rtns = 0;
+
 int find_candidate_rtns_for_tc(IMG img)
 {
-    int rc = 0;
     // go over routines and check if they are candidates for translation and mark them for translation:
+    ADDRINT last_selected_rtn_end = 0;
 
     for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec))
     {
@@ -1591,136 +2059,50 @@ int find_candidate_rtns_for_tc(IMG img)
 
         for (RTN rtn = SEC_RtnHead(sec); RTN_Valid(rtn); rtn = RTN_Next(rtn))
         {
-            // Keep the entry num of the rtn head in case we need to
-            // revert the insertin of the instruction in rtn into the instructions
-            // map due to an invalid decoding.
-            //unsigned rtn_entry = num_of_instr_map_entries;
+            // EX4: skip routines that must not / cannot be translated.
+            if (!IsCandidateRtnForTranslation(rtn, last_selected_rtn_end))
+                continue;
 
-            //if (RTN_Name(rtn) == ".plt")
-            //    continue;
-            
+            // Keep the state before this routine, in order to revert the
+            // insertion of its instructions if its translation fails.
+            // (EX4: the original code aborted the WHOLE translation here.)
+            unsigned saved_num_entries = num_of_instr_map_entries;
+            unsigned saved_bbl_num = bbl_num;
+            bbl_map_t saved_bbl = bbl_map[bbl_num];
+            unsigned saved_jump_sites = num_prof_indirect_jump_sites;
+            unsigned saved_call_sites = num_prof_indirect_call_sites;
+            unsigned saved_unsupported = num_unsupported_indirect_sites;
+            unsigned long saved_bbl_stubs = g_num_bbl_stubs;
+            unsigned long saved_rax_skipped = g_num_rax_save_skipped;
+
             // Open the RTN.
             RTN_Open( rtn );
-
-            // Map all instructions that are a target of some direct jump or call in the rtn.
-            std::map<ADDRINT, bool>is_targ_map;
-            is_targ_map.empty();
-            for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins)) {
-               if (INS_IsDirectControlFlow(ins)) {
-                 ADDRINT targ_addr = INS_DirectControlFlowTargetAddress(ins);
-                 is_targ_map[targ_addr] = true;
-               }
-            }
-
-            for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins)) {
-
-                //debug print of orig instruction:
-                if (KnobVerbose) {
-                    cerr << "old instr: ";
-                    cerr << "0x" << hex << INS_Address(ins) << ": " << INS_Disassemble(ins) <<  endl;
-                    //xed_print_hex_line(reinterpret_cast<UINT8*>(INS_Address (ins)), INS_Size(ins));
-                }
-
-                ADDRINT ins_addr = INS_Address(ins);
-
-                xed_decoded_inst_t xedd;
-                xed_error_enum_t xed_code;
-
-                // Add instr into instr map:
-                bool isRtnHeadIns = (RTN_Address(rtn) == ins_addr);
-                ins_enum_t ins_type = (isRtnHeadIns ? RtnHeadIns : RegularIns);
-
-                // Insert a NOP7 instr at Rtn Head to be used in order
-                // to restore orig target of a cond jumps to a routine.
-                //
-                if (!KnobNoProfile && isRtnHeadIns) {
-                  rc = create_nop7_xedd_instr(&xedd);
-                  if (rc < 0) {
-                    cerr << "ERROR: failed to create a NOP7 instr during translation of instr at: "
-                         << "0x" << hex << ins_addr << endl;
-                    return -1;
-                  }
-                  rc = add_new_instr_entry(&xedd, ins_addr, ins_type);
-                  if (rc < 0) {
-                    cerr << "ERROR: failed during instructon translation." << endl;
-                    return -1;
-                  }
-                  ins_type = RegularIns;
-                }
-
-                // Check if ins is a control transfer instr that terminates a BBL
-                // or the next instr is a target of a direct branch or call.
-                // An indirect call also terminates a BBL, so that the BBL's
-                // profiling stub (placed right before it) records the call
-                // targets in that BBL's own targ_addr[]/targ_count[] slots.
-                // Direct calls do not end a BBL (their target is known).
-                INS next_ins = INS_Next(ins);
-                bool isNextInsJumpTarget =
-                    (!INS_Valid(next_ins) ? false : is_targ_map[INS_Address(next_ins)]);
-                bool isInsTerminatesBBL = (isJumpOrRet(ins) || isIndirectCall(ins) ||
-                                           isNextInsJumpTarget);
-
-                // Add profiling instructions to count each BBL exec at runtime:
-                //
-                if (!KnobNoProfile) {
-                  // Do not insert the profiling now if there is a later instr
-                  // in the BBL that kills RAX.
-                  if (isInsTerminatesBBL) {
-                    rc = add_profiling_instrs(ins, ins_addr, &bbl_map[bbl_num].counter, bbl_num);
-                    if (rc < 0)
-                      return -1;
-                  }
-                }
-          
-                // Add ins to instr_map:
-                //
-                xed_decoded_inst_zero_set_mode(&xedd,&dstate);
-                xed_code = xed_decode(&xedd, reinterpret_cast<UINT8*>(ins_addr), max_inst_len);
-                if (xed_code != XED_ERROR_NONE) {
-                    cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << ins_addr << endl;
-                    return -1;
-                }
-
-                // Add the instr into the instr_map table.
-                rc = add_new_instr_entry(&xedd, INS_Address(ins), ins_type);
-                if (rc < 0) {
-                    cerr << "ERROR: failed during instructon translation." << endl;
-                    return -1;
-                }
-
-                if (isInsTerminatesBBL) {
-                  bbl_map[bbl_num].terminating_ins_entry = num_of_instr_map_entries - 1;
-                  bbl_num++;
-                  bbl_map[bbl_num].starting_ins_entry = num_of_instr_map_entries;
-                }
-
-                // Apply edge Profiling: For BBLs that end with a conditional branch,
-                //     insert an increment of the fallthrough counter for this BBL,
-                //     immediately after the cond branch which terminates the bbl.
-                //     and before the next BBL.
-                if (!KnobNoProfile && INS_Category(ins) == XED_CATEGORY_COND_BR) {
-                  rc = add_profiling_instrs(ins, ins_addr,
-                                            &bbl_map[bbl_num - 1].fallthru_counter, bbl_num-1);
-                  if (rc < 0)
-                    return -1;
-                }
-
-            } // end for INS...
-
-            // debug print of routine name:
-            if (KnobVerbose) {
-                cerr <<   "rtn name: " << RTN_Name(rtn) << endl;
-            }
-
+            int rc = translate_rtn_into_instr_map(rtn);
             // Close the RTN.
             RTN_Close( rtn );
 
-            // Apply local chaining of direct calls and branches for this routine.
-            //chain_all_direct_jmp_and_call_target_entries(rtn_entry, num_of_instr_map_entries);
+            if (rc < 0) {
+                // Revert: the routine keeps running its original code.
+                cerr << "reverting the translation of routine: " << RTN_Name(rtn) << endl;
+                num_of_instr_map_entries = saved_num_entries;
+                memset(&bbl_map[saved_bbl_num], 0, (bbl_num - saved_bbl_num + 1) * sizeof(bbl_map_t));
+                bbl_num = saved_bbl_num;
+                bbl_map[bbl_num] = saved_bbl;
+                num_prof_indirect_jump_sites = saved_jump_sites;
+                num_prof_indirect_call_sites = saved_call_sites;
+                num_unsupported_indirect_sites = saved_unsupported;
+                g_num_bbl_stubs = saved_bbl_stubs;
+                g_num_rax_save_skipped = saved_rax_skipped;
+                num_reverted_rtns++;
+                continue;
+            }
+            num_translated_rtns++;
 
          } // end for RTN..
     } // end for SEC...
 
+    cerr << " translated routines: " << dec << num_translated_rtns
+         << " (reverted: " << num_reverted_rtns << ")" << endl;
     return 0;
 }
 
@@ -1772,6 +2154,14 @@ inline void commit_translated_rtns_to_tc()
                 << instr_map[i].orig_ins_addr << "\n";
            continue;
         }
+
+        // EX4: only probe at the exact start of the routine, and only if Pin
+        // says the probe is safe (a probe that overwrites the target of a jump
+        // inside the routine can crash the application).
+        if (RTN_Address(rtn) != instr_map[i].orig_ins_addr)
+           continue;
+        if (!RTN_IsSafeForProbedReplacement(rtn))
+           continue;
 
         // Debug print.
         // cerr << "committing rtN: " << RTN_Name(rtn);
@@ -2530,6 +2920,14 @@ int create_tc2()
 /****************************/
 void create_tc2_thread_func(void *v)
 {
+    // EX4: this thread is spawned in main(), before the TC exists. Wait until
+    // create_tc() has built and committed the TC, so that prof_time counts
+    // profiling time only (and instr_map is never used before it is ready).
+    while (tc_state == 0)
+        usleep(1000);
+    if (tc_state < 0)
+        PIN_ExitThread(0);            // no TC: nothing to profile
+
    // Wait prof_time seconds for the profiling to count
     // execution frequency for each BBL.
     cerr << " prof time: " << dec << KnobNumSecsDuringProfile << " sec\n";
@@ -2610,9 +3008,12 @@ int allocate_and_init_memory(IMG img)
     // Allocate the needed memory for tc and tc2 + jump orig addr map
     // with RW+EXEC permissions which is not
     // located in an address that is more than 32bits afar:
+    // jump_to_orig_addr_map holds one slot per distinct original address that
+    // translated code jumps/calls to directly (mostly non-translated routines).
+    max_jump_to_orig_addr_count = 2 * max_rtn_count + 1024;
     const size_t mem_size =
               max_tc_size +                     // TC + TC2 size
-              max_rtn_count * sizeof(ADDRINT);  // jump_to_orig_addr_map size
+              max_jump_to_orig_addr_count * sizeof(ADDRINT);  // jump_to_orig_addr_map size
     char *addr = nullptr;
     ADDRINT max_distance = 0x7FFFFFFF;
     const size_t step = pagesize; // Try every page
@@ -2692,7 +3093,8 @@ int allocate_and_init_memory(IMG img)
     }
 
     // Allocate memory for the bbl_map table.
-    bbl_map = (bbl_map_t *)calloc(max_ins_count, sizeof(bbl_map_t));
+    max_bbl_count = max_ins_count;
+    bbl_map = (bbl_map_t *)calloc(max_bbl_count, sizeof(bbl_map_t));
     if (bbl_map == NULL) {
         perror("calloc");
         return -1;
@@ -2762,6 +3164,7 @@ VOID create_tc(IMG img, VOID *v)
     rc = allocate_and_init_memory(img);
     if (rc < 0) {
         cerr << "failed to initialize memory for translation\n";
+        tc_state = -1;
         return;
     }
     cerr << "after memory allocation" << endl;
@@ -2771,6 +3174,7 @@ VOID create_tc(IMG img, VOID *v)
     rc = find_candidate_rtns_for_tc(img);
     if (rc < 0) {
         cerr << "failed to find candidates for translation\n";
+        tc_state = -1;
         return;
     }
     cerr << "after identifying candidate routines" << endl;
@@ -2778,6 +3182,8 @@ VOID create_tc(IMG img, VOID *v)
          << " jump sites, " << num_prof_indirect_call_sites << " call sites"
          << " (" << num_unsupported_indirect_sites << " unsupported sites not profiled)"
          << endl;
+    cerr << " [deadreg-opt] profiling stubs: " << dec << g_num_bbl_stubs
+         << " | RAX save/restore skipped: " << g_num_rax_save_skipped << endl;
 
     // Step 3: Chaining - calculate direct branch and call instructions to point
     //         to corresponding target instr entries:
@@ -2788,6 +3194,7 @@ VOID create_tc(IMG img, VOID *v)
     rc = set_initial_estimated_new_ins_addrs_in_tc(tc);
     if (rc < 0 ) {
         cerr << "failed to set initial estimated new ins addrs in the TC\n";
+        tc_state = -1;
         return;
     }
     cerr << "after setting initial estimated new ins addrs in the TC" << endl;
@@ -2796,6 +3203,7 @@ VOID create_tc(IMG img, VOID *v)
     rc = fix_instructions_displacements();
     if (rc < 0 ) {
         cerr << "failed to fix displacments of translated instructions\n";
+        tc_state = -1;
         return;
     }
     cerr << "after fixing instructions displacements" << endl;
@@ -2804,6 +3212,7 @@ VOID create_tc(IMG img, VOID *v)
     rc = copy_instrs_to_tc(tc);
     if (rc < 0 ) {
         cerr << "failed to copy the instructions to the translation cache\n";
+        tc_state = -1;
         return;
     }
     tc_size = rc;
@@ -2830,6 +3239,10 @@ VOID create_tc(IMG img, VOID *v)
     double elapsed = (end.tv_sec - start.tv_sec) +
 	                 (end.tv_nsec - start.tv_nsec) / 1e9;
     cerr << " create_tc took: " << elapsed << " seconds\n";
+
+    // EX4: let the TC2 thread start counting prof_time.
+    __sync_synchronize();
+    tc_state = 1;
 }
 
 

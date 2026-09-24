@@ -22,7 +22,18 @@ struct mock_rtn_t { ADDRINT addr; USIZE size; std::string name; };
 std::vector<mock_rtn_t> g_mock_rtns;                 // filled by the test
 std::map<ADDRINT, ADDRINT> g_mock_replaced;          // RTN_ReplaceProbed: orig -> new
 
-struct mock_ins_t { xed_decoded_inst_t xedd; ADDRINT addr; ADDRINT end; };
+// Registers (Pin's REG) are XED registers in the mock.
+namespace LEVEL_BASE {
+  typedef xed_reg_enum_t REG;
+  static const REG REG_RAX = XED_REG_RAX, REG_RBX = XED_REG_RBX, REG_RCX = XED_REG_RCX;
+}
+using namespace LEVEL_BASE;
+
+struct mock_ins_t {
+  xed_decoded_inst_t xedd; ADDRINT addr; ADDRINT end;
+  bool bad;                           // bytes XED cannot decode (length 1, like a data byte)
+  std::vector<REG> rregs, wregs;      // registers read / written (explicit + implicit)
+};
 typedef mock_ins_t *INS;
 struct IMG { int x; };
 struct SEC { int idx; };
@@ -43,18 +54,41 @@ public:
 struct KNOB_BASE { static std::string StringKnobSummary() MOCK_ABORT };
 
 // --- INS: decoded from real memory with XED ---
+static inline void mock_add_reg(std::vector<REG> &v, REG r) {
+  if (r != XED_REG_INVALID) v.push_back(r);
+}
 static inline INS mock_decode_ins(ADDRINT addr, ADDRINT end) {
   if (addr >= end) return 0;
   mock_ins_t *ins = new mock_ins_t;                  // leaked on purpose (tests only)
   xed_state_t st = {XED_MACHINE_MODE_LONG_64, XED_ADDRESS_WIDTH_64b};
   xed_decoded_inst_zero_set_mode(&ins->xedd, &st);
-  if (xed_decode(&ins->xedd, (const UINT8 *)addr, XED_MAX_INSTRUCTION_BYTES) != XED_ERROR_NONE) abort();
   ins->addr = addr; ins->end = end;
+  ins->bad = (xed_decode(&ins->xedd, (const UINT8 *)addr, XED_MAX_INSTRUCTION_BYTES) != XED_ERROR_NONE);
+  if (ins->bad) return ins;
+  // Registers read/written, as Pin's INS_RegR/INS_RegW report them: all
+  // register operands (explicit and implicit) plus the base/index registers
+  // of memory and address (lea) operands, which are read.
+  const xed_inst_t *xi = xed_decoded_inst_inst(&ins->xedd);
+  unsigned memop = 0;
+  for (unsigned i = 0; i < xed_inst_noperands(xi); i++) {
+    const xed_operand_t *op = xed_inst_operand(xi, i);
+    xed_operand_enum_t name = xed_operand_name(op);
+    if (xed_operand_is_register(name)) {
+      REG r = xed_decoded_inst_get_reg(&ins->xedd, name);
+      if (xed_operand_read(op)) mock_add_reg(ins->rregs, r);
+      if (xed_operand_written(op)) mock_add_reg(ins->wregs, r);
+    } else if (name == XED_OPERAND_MEM0 || name == XED_OPERAND_MEM1 || name == XED_OPERAND_AGEN) {
+      unsigned m = (name == XED_OPERAND_MEM1) ? 1 : (name == XED_OPERAND_AGEN ? 0 : memop);
+      mock_add_reg(ins->rregs, xed_decoded_inst_get_base_reg(&ins->xedd, m));
+      mock_add_reg(ins->rregs, xed_decoded_inst_get_index_reg(&ins->xedd, m));
+      if (name == XED_OPERAND_MEM0) memop = 1;
+    }
+  }
   return ins;
 }
 static inline xed_decoded_inst_t *INS_XedDec(INS ins) { return &ins->xedd; }
 static inline ADDRINT INS_Address(INS ins) { return ins->addr; }
-static inline USIZE INS_Size(INS ins) { return xed_decoded_inst_get_length(&ins->xedd); }
+static inline USIZE INS_Size(INS ins) { return ins->bad ? 1 : xed_decoded_inst_get_length(&ins->xedd); }
 static inline BOOL INS_Valid(INS ins) { return ins != 0; }
 static inline INS INS_Next(INS ins) { return mock_decode_ins(ins->addr + INS_Size(ins), ins->end); }
 static inline xed_category_enum_t INS_Category(INS ins) { return xed_decoded_inst_get_category(&ins->xedd); }
@@ -68,6 +102,17 @@ static inline BOOL INS_IsIndirectControlFlow(INS ins) {
   return (c == XED_CATEGORY_CALL || c == XED_CATEGORY_UNCOND_BR) && !INS_IsDirectControlFlow(ins); }
 static inline ADDRINT INS_DirectControlFlowTargetAddress(INS ins) {
   return ins->addr + INS_Size(ins) + xed_decoded_inst_get_branch_displacement(&ins->xedd); }
+static inline UINT32 INS_MaxNumRRegs(INS ins) { return ins->rregs.size(); }
+static inline UINT32 INS_MaxNumWRegs(INS ins) { return ins->wregs.size(); }
+static inline REG INS_RegR(INS ins, UINT32 i) { return ins->rregs[i]; }
+static inline REG INS_RegW(INS ins, UINT32 i) { return ins->wregs[i]; }
+static inline REG REG_FullRegName(REG r) { return xed_get_largest_enclosing_register(r); }
+static inline UINT32 REG_Size(REG r) { return xed_get_register_width_bits64(r) / 8; }
+static inline BOOL INS_IsSyscall(INS ins) { return INS_Category(ins) == XED_CATEGORY_SYSCALL; }
+// Pin: CMOVcc and REP-prefixed string instrs are predicated.
+static inline BOOL INS_IsPredicated(INS ins) {
+  return INS_Category(ins) == XED_CATEGORY_CMOV ||
+         xed_operand_values_has_real_rep(xed_decoded_inst_operands_const(&ins->xedd)); }
 static inline std::string INS_Disassemble(INS ins) {
   char buf[256]; xed_format_context(XED_SYNTAX_INTEL, &ins->xedd, buf, sizeof buf, ins->addr, 0, 0);
   return buf; }
