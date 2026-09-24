@@ -77,6 +77,7 @@ extern "C" {
 #include <values.h>
 #include <set>
 #include <map>
+#include <vector>
 #include <time.h>
 #include <fstream>
 
@@ -108,6 +109,13 @@ KNOB<BOOL> KnobDumpProfile(KNOB_MODE_WRITEONCE,    "pintool",
 
 KNOB<BOOL> KnobNoProfile(KNOB_MODE_WRITEONCE,    "pintool",
     "no_prof", "0", "Do not collect profile information");
+
+KNOB<UINT> KnobDevirtPercent(KNOB_MODE_WRITEONCE,    "pintool",
+    "devirt_pct", "90", "De-virtualize an indirect jump/call in TC2 when one target "
+    "took at least this percentage of its executions during profiling");
+
+KNOB<BOOL> KnobNoDevirt(KNOB_MODE_WRITEONCE,    "pintool",
+    "no_devirt", "0", "Do not apply de-virtualization in TC2");
 
 
 /* ===================================================================== */
@@ -1863,6 +1871,262 @@ int commit_translated_rtns_to_tc2()
 }
 
 
+/* ============================================================= */
+/* De-virtualization (TC2)                                       */
+/* ============================================================= */
+//
+// THRESHOLD ("frequent" vs "rare" target):
+//   A target of an indirect jump/call is FREQUENT when it took at least
+//   -devirt_pct percent (default 90%) of that jump/call's executions
+//   during profiling, i.e.  hot_count * 100 >= exec_count * devirt_pct.
+//   Only a site with a frequent target is de-virtualized. All its other
+//   targets are rare and keep using the original indirect jmp/call.
+//
+// WHAT IS EMITTED IN TC2 (T = the frequent target):
+//
+//   indirect call 'call X'            indirect jump 'jmp X'
+//   ----------------------            ---------------------
+//     cmp  X, T                         cmp  X, T
+//     jne  miss                         je   T_in_TC2    ; direct jump
+//     call T_in_TC2  ; direct call      jmp  X           ; original instr
+//     jmp  done
+//   miss:
+//     call X         ; original instr
+//   done:
+//
+//   X is the original target operand (a register or a memory operand), so
+//   a rare target still reaches the right place. T_in_TC2 is the TC2 copy
+//   of T: the direct call/jump also skips the probe jumps
+//   (original code -> TC -> TC2) that the indirect call went through, and
+//   for jump tables it keeps execution inside TC2 (a jump-table entry holds
+//   an ORIGINAL code address).
+//
+// A site is NOT de-virtualized (it is copied unchanged) when:
+//   - no target reaches the threshold,
+//   - T is not translated (a direct jump to it would leave TC2),
+//   - T does not fit in the signed 32-bit immediate of 'cmp' (a binary
+//     loaded above 2GB, e.g. PIE),
+//   - its form is not supported (see get_indirect_target_operand()).
+//
+// SAFETY NOTES:
+//   - 'cmp' modifies RFLAGS. At a call this is safe: by the ABI a called
+//     function does not receive flags. At an indirect jump we assume the
+//     flags are not used by the target, the same assumption the profiling
+//     stub in TC makes (it runs AND before the jump).
+//   - The profiled hot target is only a hint (two targets may share a
+//     profiling slot). Correctness never depends on it, since the 'cmp'
+//     checks the real target every time.
+
+// Statistics printed after TC2 is built.
+unsigned num_devirt_calls = 0;
+unsigned num_devirt_jumps = 0;
+unsigned num_devirt_skip_rare = 0;
+unsigned num_devirt_skip_not_translated = 0;
+unsigned num_devirt_skip_far_targ = 0;
+unsigned num_devirt_skip_other = 0;
+
+// Step 0 of create_tc2(): choose the sites to de-virtualize.
+// Must run BEFORE Step 1, while instr_map[].orig_ins_addr still holds the
+// original addresses.
+//   orig_to_tc : original instr address -> its address in TC
+//   sites      : instr_map index of the indirect jmp/call -> hot target (orig addr)
+static void find_devirt_sites(const std::map<ADDRINT, ADDRINT> &orig_to_tc,
+                              std::map<unsigned, ADDRINT> &sites)
+{
+    for (unsigned b = 0; b < bbl_num; b++) {
+      if (bbl_map[b].indirect_kind == NoIndirect || !bbl_map[b].counter)
+        continue;
+
+      // The hottest target of this site.
+      unsigned best = 0;
+      for (unsigned j = 1; j <= MAX_TARG_ADDRS; j++)
+        if (bbl_map[b].targ_count[j] > bbl_map[b].targ_count[best])
+          best = j;
+      ADDRINT hot_targ = bbl_map[b].targ_addr[best];
+      UINT64 hot_count = bbl_map[b].targ_count[best];
+      UINT64 exec_count = bbl_map[b].counter;
+
+      // The threshold: the hot target must be FREQUENT.
+      if (hot_count * 100 < exec_count * KnobDevirtPercent.Value()) {
+        num_devirt_skip_rare++;
+        continue;
+      }
+      if (!orig_to_tc.count(hot_targ)) {
+        num_devirt_skip_not_translated++;
+        continue;
+      }
+      if (hot_targ > 0x7FFFFFFF) {
+        num_devirt_skip_far_targ++;
+        continue;
+      }
+      // The indirect jmp/call is the instr that terminates this BBL.
+      unsigned site = bbl_map[b].terminating_ins_entry;
+      if (site + 1 >= num_of_instr_map_entries ||
+          instr_map[site].orig_ins_addr != bbl_map[b].indirect_site_addr) {
+        num_devirt_skip_other++;
+        continue;
+      }
+      sites[site] = hot_targ;
+
+      if (KnobDumpProfile) {
+        cerr << "devirt " << (bbl_map[b].indirect_kind == IndirectCall ? "call" : "jump")
+             << " at 0x" << hex << bbl_map[b].indirect_site_addr
+             << " -> 0x" << hot_targ << " (" << dec << hot_count << " of "
+             << exec_count << " executions)" << endl;
+      }
+    }
+}
+
+// Emit the de-virtualized code for the indirect jmp/call 'site' (see the
+// table above) at the end of the NEW instr_map.
+// 'hot_targ_tc' is the TC address of the hot target: chaining turns it into
+// the TC2 address later. The two branches inside a call sequence (jne miss,
+// jmp done) are returned in 'internal_branches' as (branch entry, target
+// entry) pairs, to be set after chaining.
+// Returns 1 if emitted, 0 if the form is not supported (the caller then
+// copies the site unchanged), -1 on an encoding error.
+static int emit_devirt_site(const instr_map_t *site, ADDRINT hot_targ, ADDRINT hot_targ_tc,
+                            std::vector<std::pair<unsigned, unsigned> > &internal_branches)
+{
+    xed_decoded_inst_t xedd;
+    xed_decoded_inst_zero_set_mode(&xedd, &dstate);
+    if (xed_decode(&xedd, reinterpret_cast<const UINT8*>(site->encoded_ins), max_inst_len) != XED_ERROR_NONE)
+      return 0;
+    indirect_target_t t;
+    if (!get_indirect_target_operand(&xedd, site->orig_ins_addr, &t))
+      return 0;
+    bool is_call = (xed_decoded_inst_get_category(&xedd) == XED_CATEGORY_CALL);
+
+    // All new instrs get the address of the site as their orig_ins_addr
+    // (like the profiling stubs did in TC), so a branch that targeted the
+    // site now lands on the 'cmp'.
+    ADDRINT key = site->orig_ins_addr;
+    xed_encoder_instruction_t enc_instr;
+
+    // 1. cmp X, T   (T as a sign-extended 32-bit immediate)
+    if (t.targ_reg != XED_REG_INVALID) {
+      xed_inst2(&enc_instr, dstate, XED_ICLASS_CMP, 64,
+                xed_reg(t.targ_reg), xed_simm0((xed_int32_t)hot_targ, 32));
+    } else if (t.base_reg == XED_REG_RIP) {
+      // The displacement is set by fix_rip_displacement() from orig_rip_addr.
+      xed_inst2(&enc_instr, dstate, XED_ICLASS_CMP, 64,
+                xed_mem_bd(XED_REG_RIP, xed_disp(0, 32), 64),
+                xed_simm0((xed_int32_t)hot_targ, 32));
+    } else {
+      xed_inst2(&enc_instr, dstate, XED_ICLASS_CMP, 64,
+                xed_mem_bisd(t.base_reg, t.index_reg, t.scale,
+                             xed_disp(t.disp, t.disp_width), 64),
+                xed_simm0((xed_int32_t)hot_targ, 32));
+    }
+    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0)
+      return -1;
+    if (t.base_reg == XED_REG_RIP)
+      instr_map[num_of_instr_map_entries - 1].orig_rip_addr = site->orig_rip_addr;
+
+    if (is_call) {
+      // 2. jne miss
+      xed_inst1(&enc_instr, dstate, XED_ICLASS_JNZ, 64, xed_relbr(0, 32));
+      if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0)
+        return -1;
+      unsigned jne_entry = num_of_instr_map_entries - 1;
+
+      // 3. call T_in_TC2  (direct)
+      xed_inst1(&enc_instr, dstate, XED_ICLASS_CALL_NEAR, 64, xed_relbr(0, 32));
+      if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0)
+        return -1;
+      instr_map[num_of_instr_map_entries - 1].orig_targ_addr = hot_targ_tc;
+
+      // 4. jmp done
+      xed_inst1(&enc_instr, dstate, XED_ICLASS_JMP, 64, xed_relbr(0, 32));
+      if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0)
+        return -1;
+      unsigned jmp_entry = num_of_instr_map_entries - 1;
+
+      // 5. miss: the original 'call X'
+      unsigned miss_entry = num_of_instr_map_entries;
+      instr_map[num_of_instr_map_entries] = *site;
+      instr_map[num_of_instr_map_entries].targ_map_entry = -1;
+      num_of_instr_map_entries++;
+
+      // 'done' is the next entry, i.e. the instr after the original call.
+      internal_branches.push_back(std::make_pair(jne_entry, miss_entry));
+      internal_branches.push_back(std::make_pair(jmp_entry, miss_entry + 1));
+      num_devirt_calls++;
+    } else {
+      // 2. je T_in_TC2  (direct)
+      xed_inst1(&enc_instr, dstate, XED_ICLASS_JZ, 64, xed_relbr(0, 32));
+      if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0)
+        return -1;
+      instr_map[num_of_instr_map_entries - 1].orig_targ_addr = hot_targ_tc;
+
+      // 3. the original 'jmp X'
+      instr_map[num_of_instr_map_entries] = *site;
+      instr_map[num_of_instr_map_entries].targ_map_entry = -1;
+      num_of_instr_map_entries++;
+      num_devirt_jumps++;
+    }
+    if (num_of_instr_map_entries >= max_ins_count)
+      return -1;
+    return 1;
+}
+
+// Step 1b of create_tc2(): build a new instr_map in which every chosen
+// site is replaced by its de-virtualized code (the other entries are
+// copied as they are). Runs after Step 1, so all orig_ins_addr/orig_targ_addr
+// fields already hold TC addresses and entry indices may change.
+static int insert_devirt_sites(const std::map<unsigned, ADDRINT> &sites,
+                               const std::map<ADDRINT, ADDRINT> &orig_to_tc,
+                               std::vector<std::pair<unsigned, unsigned> > &internal_branches)
+{
+    if (sites.empty())
+      return 0;
+
+    instr_map_t *old_map = instr_map;
+    unsigned old_num = num_of_instr_map_entries;
+    unsigned extra = 8 * sites.size() + 16;   // at most 4 new entries per site
+
+    instr_map_t *new_map = (instr_map_t *)calloc(max_ins_count + extra, sizeof(instr_map_t));
+    if (new_map == NULL) {
+      perror("calloc");
+      return -1;
+    }
+    instr_map = new_map;
+    max_ins_count += extra;
+    num_of_instr_map_entries = 0;
+
+    std::vector<unsigned> new_index(old_num + 1);
+    for (unsigned i = 0; i < old_num; i++) {
+      new_index[i] = num_of_instr_map_entries;
+      std::map<unsigned, ADDRINT>::const_iterator it = sites.find(i);
+      if (it != sites.end()) {
+        int rc = emit_devirt_site(&old_map[i], it->second, orig_to_tc.at(it->second),
+                                  internal_branches);
+        if (rc < 0)
+          return -1;
+        if (rc > 0) {
+          // The new entries belong to the BBL of the site.
+          for (unsigned k = new_index[i]; k < num_of_instr_map_entries; k++)
+            instr_map[k].bbl_num = old_map[i].bbl_num;
+          continue;
+        }
+        num_devirt_skip_other++;             // unsupported form: copy it
+      }
+      instr_map[num_of_instr_map_entries++] = old_map[i];
+    }
+    new_index[old_num] = num_of_instr_map_entries;
+
+    // Keep the BBL -> instr_map indices valid.
+    for (unsigned b = 0; b < bbl_num; b++) {
+      if (bbl_map[b].starting_ins_entry <= old_num)
+        bbl_map[b].starting_ins_entry = new_index[bbl_map[b].starting_ins_entry];
+      if (bbl_map[b].terminating_ins_entry <= old_num)
+        bbl_map[b].terminating_ins_entry = new_index[bbl_map[b].terminating_ins_entry];
+    }
+
+    free(old_map);
+    return 0;
+}
+
 /****************/
 /* create_tc2() */
 /****************/
@@ -1872,6 +2136,17 @@ int commit_translated_rtns_to_tc2()
 int create_tc2()
 {
     int rc = 0;
+
+    // Step 0: De-virtualization - choose the indirect jumps/calls whose
+    //         profiled hot target is frequent (see find_devirt_sites()).
+    //         Must run before Step 1 overwrites the original addresses.
+    std::map<ADDRINT, ADDRINT> orig_to_tc;        // orig instr addr -> TC addr
+    std::map<unsigned, ADDRINT> devirt_sites;     // instr_map entry -> hot target
+    if (!KnobNoDevirt) {
+      for (unsigned i = 0; i < num_of_instr_map_entries; i++)
+        orig_to_tc.emplace(instr_map[i].orig_ins_addr, instr_map[i].new_ins_addr); // first wins
+      find_devirt_sites(orig_to_tc, devirt_sites);
+    }
 
 	// Step 1: Modify instr_map to be used for TC2.
     //
@@ -1917,11 +2192,31 @@ int create_tc2()
     
     cerr << "after modifying instr_map (removed " << dec << num_removed_prof_instrs
          << " profiling instrs)" << endl;
+
+    // Step 1b: De-virtualization - replace each chosen site by
+    //          'cmp X, T / direct jmp/call to T / original jmp/call X'.
+    std::vector<std::pair<unsigned, unsigned> > devirt_internal_branches;
+    rc = insert_devirt_sites(devirt_sites, orig_to_tc, devirt_internal_branches);
+    if (rc < 0) {
+        cerr << "failed to insert de-virtualized code\n";
+        return -1;
+    }
+    cerr << "de-virtualization (threshold " << dec << KnobDevirtPercent.Value() << "%): "
+         << num_devirt_calls << " calls, " << num_devirt_jumps << " jumps"
+         << " | not done: " << num_devirt_skip_rare << " no frequent target, "
+         << num_devirt_skip_not_translated << " target not translated, "
+         << num_devirt_skip_far_targ << " target above 2GB, "
+         << num_devirt_skip_other << " other" << endl;
     
     // Step 3: Chaining - calculate direct branch and call instructions to point
     //         to corresponding target instr entries:
     //
     chain_all_direct_jmp_and_call_target_entries(0, num_of_instr_map_entries);
+    // The 'jne miss' / 'jmp done' inside de-virtualized calls point to entries
+    // of the same sequence, not to an address, so they are set here.
+    for (unsigned k = 0; k < devirt_internal_branches.size(); k++)
+      instr_map[devirt_internal_branches[k].first].targ_map_entry =
+          devirt_internal_branches[k].second;
     cerr << "after chaining all branch targets" << endl;
 
     // Step 4: Set initial estimated new addrs for each instruction in tc2.

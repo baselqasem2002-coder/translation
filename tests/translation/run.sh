@@ -8,6 +8,7 @@
 #
 # stub_test     - profiling stubs for indirect jumps/calls (add_profiling_instrs)
 # pipeline_test - create_tc() -> run in TC -> disable profiling -> create_tc2() -> run in TC2
+# devirt_test   - de-virtualization of indirect calls/jumps in TC2 (90% threshold)
 # Debug: DUMP=1 prints dump_tc() output, VERB=1 (stub_test) enables -verbose.
 set -e
 cd "$(dirname "$0")"
@@ -17,7 +18,7 @@ if [ ! -f "$XED_KIT/lib/libxed.a" ]; then
   exit 1
 fi
 OUT=${TMPDIR:-/tmp}
-for t in stub_test pipeline_test; do
+for t in stub_test pipeline_test devirt_test; do
   echo "=== $t"
   g++ -std=c++11 -O1 -no-pie -Wall -Wno-unknown-pragmas \
       -DTARGET_IA32E -DHOST_IA32E -DTARGET_LINUX \
