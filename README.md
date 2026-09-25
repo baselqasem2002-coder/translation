@@ -1,85 +1,56 @@
-# translation — `project.so` (Pin, probe mode)
+# translation — Project 2026: `project.so`
 
-A skeleton for the 2026 project pintool. It profiles the program in **TC1**
-for `-prof_time` seconds. Then a background thread builds **TC2** from that
-profile and moves execution there while the program is running.
+A Pin probe-mode tool. It profiles the main executable in a translation cache
+(TC) for `-prof_time` seconds, then builds an optimized second cache (TC2) with
+de-virtualization and code reordering, and moves execution to it.
 
-```
-pin -t obj-intel64/project.so [-prof_time <seconds>] -- ./app <args>
-```
+The submission README (names, compilation, how to run, thresholds, design) is
+[`src/README.txt`](src/README.txt).
 
-| Knob         | Default | Meaning                                                  |
-|--------------|---------|----------------------------------------------------------|
-| `-prof_time` | `2`     | Seconds spent profiling in TC1 before switching to TC2   |
+## Layout
 
-## Files
+| Path | What it is |
+|------|------------|
+| `src/` | The submission sources: `project.cpp`, `makefile`, `makefile.rules`, `README.txt` |
+| `tests/translation/` | Tests that run the tool's code generation natively, without Pin |
+| `ex4/` | Our exercise 4 (`bprofile.cpp` and its README), kept for reference |
+| `course/` | Course material: `project-2026.pdf`, `bprofile-with-gearing.cpp.txt`, the reverse-cond-jumps example, the code reordering paper |
 
-| File                      | What it is                                                         |
-|---------------------------|--------------------------------------------------------------------|
-| `project.cpp`             | The pintool: knob, tables, TC1/TC2 hooks, timer thread, the switch |
-| `tc_dispatch.h`           | Dispatch slots/stubs used for the TC1 → TC2 switch (no Pin needed) |
-| `tests/test_dispatch.cpp` | Multi-threaded test of the switch, runs without Pin                |
-| `makefile`, `makefile.rules` | Standard Pin kit build files                                    |
-
-## Timeline
+## Build
 
 ```
-ImageLoad(main exe)   build TC1 (+ ex4 counters), probe each routine -> its dispatch stub
-ApplicationStart      spawn internal thread (PIN_SpawnInternalThread)
-0 .. prof_time        app runs in TC1, counters grow; thread sleeps (PIN_Sleep)
-prof_time             thread: snapshot counters -> build_tc2(profile) -> switch_to_tc2()
-after                 every new call of a translated routine runs in TC2
+cd src
+make PIN_ROOT=<path-to-pin-kit> obj-intel64/project.so
 ```
 
-## How the switch works (and why it is safe)
+## Tests
+
+The tests compile `src/project.cpp` against a mock `pin.H` and the XED library
+of the Pin kit, then execute the generated TC/TC2 code:
 
 ```
-original routine        dispatch stub (fixed)          slot (8-byte data)
-+------------------+    +-------------------------+    +-----------+
-| jmp stub (probe) |--->| jmp qword ptr [slot_i]  |--->| TC1 entry |  before
-+------------------+    +-------------------------+    | TC2 entry |  after
+PIN_ROOT=<path-to-pin-kit> tests/translation/run.sh
 ```
 
-* Probes (`RTN_ReplaceProbed`) are placed only once, in `ImageLoad`. They
-  point at a stub and **not** at TC1, so they never need to change.
-* Switching a routine means one atomic 8-byte store into its slot. No
-  instruction bytes change while the program runs.
-* TC1 is never freed. Threads already inside TC1 finish there, and return
-  addresses that point into TC1 stay valid.
+| Test | Checks |
+|------|--------|
+| `stub_test` | profiling stubs for indirect jumps/calls record the right targets |
+| `pipeline_test` | `create_tc()` → TC → stop profiling → `create_tc2()` → TC2, and TC2 has no profiling code |
+| `devirt_test` | de-virtualization: register/memory/`[rip+disp]` forms, the 90% boundary, rare targets |
+| `reorder_test` | code reordering: TC2 layout per instruction, reversed branches, added jumps, all paths |
+| `ex4_merge_test` | exercise 4 fixes: routine filters, revert on failure, jcc to original code, dead-register optimization |
 
-## Where `bprofile-with-gearing.cpp` goes
+They test code generation only. They do not replace running the tool under Pin
+on the course binaries.
 
-See **Part 2** of `project.cpp`:
+## Submission (`project.zip`)
 
-* `build_tc1(img)`: TC1 generation from bprofile/ex4. Set
-  `g_rtns[i].tc1_entry`, register BBs with `add_bbl()`, and emit counters on
-  `g_bbls[idx].exec_count` / `taken_count`.
-* `build_tc2(profile)`: TC2 generation without counters, optimized using the
-  profile. Set `g_rtns[i].tc2_entry`.
-* Use `commit_through_dispatch_slots()` **instead of** bprofile's
-  `commit_translated_routines`.
-
-Three rules (explained in the code):
-
-1. **R1:** in TC1, calls to other translated routines must go through the
-   original address or the dispatch stub, never straight to TC1.
-2. **R2:** `build_tc2` runs on the background thread. It must not call
-   `IMG_`/`RTN_`/`INS_` functions, so save what you need in `build_tc1`.
-   Allocate TC2's memory there too.
-3. **R3:** never free or overwrite TC1.
-
-Until Part 2 is filled in, the tool runs in **demo mode**. TC1 and TC2 both
-point at the original code, so the whole flow runs and can be tested.
-
-**Known limitation:** a routine that never returns (for example `main` looping
-forever) keeps running in TC1, because the switch happens at routine entry.
-
-## Build and test
+The project asks for `project.so` plus a `src` directory:
 
 ```
-# the pintool (inside the Pin kit, or with PIN_ROOT)
-make PIN_ROOT=/path/to/pin obj-intel64/project.so
-
-# the switch mechanism, no Pin needed
-g++ -O2 -pthread -o test_dispatch tests/test_dispatch.cpp && ./test_dispatch
+cd src && make PIN_ROOT=<path-to-pin-kit> obj-intel64/project.so && cd ..
+rm -rf submit && mkdir submit
+cp src/obj-intel64/project.so submit/
+mkdir submit/src && cp src/project.cpp src/makefile src/makefile.rules src/README.txt submit/src/
+(cd submit && zip -r ../project.zip project.so src)
 ```

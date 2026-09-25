@@ -22,16 +22,10 @@
 # This defines tests which run tools of the same name.  This is simply for convenience to avoid
 # defining the test name twice (once in TOOL_ROOTS and again in TEST_ROOTS).
 # Tests defined here should not be defined in TOOL_ROOTS and TEST_ROOTS.
-TEST_TOOL_ROOTS := bprofile project
+TEST_TOOL_ROOTS := project
 
 # This defines the tests to be run that were not already defined in TEST_TOOL_ROOTS.
-ifeq ($(TARGET_OS),linux)
-	TEST_ROOTS := nopincc
-endif
-
-ifeq ($(TARGET_OS),windows)
-	TEST_ROOTS :=
-endif
+TEST_ROOTS :=
 
 # This defines the tools which will be run during the the tests, and were not already defined in
 # TEST_TOOL_ROOTS.
@@ -80,9 +74,6 @@ SANITY_SUBSET := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
 # See makefile.default.rules for the default test rules.
 # All tests in this section should adhere to the naming convention: <testname>.test
 
-nopincc.test:  makefile.nopincc
-	$(MAKE) -f makefile.nopincc TARGET=$(TARGET) clean
-	$(MAKE) -f makefile.nopincc TARGET=$(TARGET)
 
 ##############################################################
 #
