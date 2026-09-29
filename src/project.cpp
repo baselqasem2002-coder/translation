@@ -2619,6 +2619,11 @@ static bool IsCandidateRtnForTranslation(RTN rtn, ADDRINT& last_selected_rtn_end
 // use is the spill of an argument 'mov [rbp+disp], reg' (in the prologue)
 // holds that slot from the routine entry on, so the slot can stay in it
 // (coalescing) without using a free register.
+// When these are used up, a callee-saved GPR (rbx, r12-r15) that the
+// routine never uses can hold a slot too: it is saved right after
+// 'mov rbp, rsp' into the stack memory of an already promoted 8 bytes slot
+// (that memory is not used any more) and restored before every
+// 'pop rbp' / 'leave'.
 //
 // THRESHOLD: at TC2 generation the slots of each routine are ordered by
 // their profiled number of accesses (sum of the BBL counters of their
@@ -2637,8 +2642,20 @@ typedef struct {
     ADDRINT rtn_addr;
     std::vector<xed_reg_enum_t> free_regs;   // 64-bit names, in order of preference
     std::map<INT64, xed_reg_enum_t> coalesce; // slot disp -> the arg reg spilled into it
+    std::vector<xed_reg_enum_t> callee_saved; // unused callee-saved GPRs
+    ADDRINT prologue_addr;                    // 'mov rbp, rsp'
+    std::vector<ADDRINT> epilogue_addrs;      // every 'pop rbp' / 'leave'
     std::vector<promo_slot_t> slots;
 } promo_rtn_t;
+
+// Save/restore of a callee-saved register used by the promotion.
+typedef struct {
+    xed_reg_enum_t reg;
+    INT64 save_disp;                          // [rbp+save_disp] holds its old value
+} promo_save_t;
+static std::map<ADDRINT, std::vector<promo_save_t> > promo_saves_after;    // prologue addr ->
+static std::map<ADDRINT, std::vector<promo_save_t> > promo_restores_before; // epilogue addr ->
+unsigned num_callee_saved_regs = 0;
 
 typedef struct {
     UINT8 encoded_ins[XED_MAX_INSTRUCTION_BYTES];
@@ -2657,7 +2674,7 @@ static const xed_reg_enum_t promo_reg_pool[] = {
     XED_REG_RDI, XED_REG_RSI, XED_REG_RCX, XED_REG_RDX
 };
 
-// The 'width' bytes part of a 64-bit GPR of promo_reg_pool.
+// The 'width' bytes part of a 64-bit GPR (of promo_reg_pool or callee-saved).
 static xed_reg_enum_t promo_sub_reg(xed_reg_enum_t r64, unsigned width)
 {
     static const xed_reg_enum_t tab[][4] = {
@@ -2669,6 +2686,11 @@ static xed_reg_enum_t promo_sub_reg(xed_reg_enum_t r64, unsigned width)
       {XED_REG_SIL,  XED_REG_SI,   XED_REG_ESI,  XED_REG_RSI},
       {XED_REG_CL,   XED_REG_CX,   XED_REG_ECX,  XED_REG_RCX},
       {XED_REG_DL,   XED_REG_DX,   XED_REG_EDX,  XED_REG_RDX},
+      {XED_REG_BL,   XED_REG_BX,   XED_REG_EBX,  XED_REG_RBX},
+      {XED_REG_R12B, XED_REG_R12W, XED_REG_R12D, XED_REG_R12},
+      {XED_REG_R13B, XED_REG_R13W, XED_REG_R13D, XED_REG_R13},
+      {XED_REG_R14B, XED_REG_R14W, XED_REG_R14D, XED_REG_R14},
+      {XED_REG_R15B, XED_REG_R15W, XED_REG_R15D, XED_REG_R15},
     };
     int w = (width == 1) ? 0 : (width == 2) ? 1 : (width == 4) ? 2 : (width == 8) ? 3 : -1;
     if (w < 0)
@@ -2838,6 +2860,8 @@ static void analyze_promotable_slots(ADDRINT rtn_addr, USIZE rtn_size,
         xed_decoded_inst_get_reg(p1, XED_OPERAND_REG1) != XED_REG_RSP)
       return;
 
+    bool epilogue_ok = true;
+    std::vector<ADDRINT> epilogues;
     std::map<xed_reg_enum_t, unsigned> touches;   // full reg -> number of instrs using it
     std::map<xed_reg_enum_t, INT64> spill_of;     // full reg -> slot, if its only use is a spill
     std::map<INT64, promo_slot_t> slots;     // disp -> slot
@@ -2863,6 +2887,20 @@ static void analyze_promotable_slots(ADDRINT rtn_addr, USIZE rtn_size,
       }
       if (cat == XED_CATEGORY_RET && iclass != XED_ICLASS_RET_NEAR)
         return;
+      if (iclass == XED_ICLASS_RET_NEAR) {
+        // Every exit must be 'pop rbp; ret' or 'leave; ret'.
+        xed_iclass_enum_t prev = (i > 0) ? xed_decoded_inst_get_iclass(insns[i - 1]) : XED_ICLASS_INVALID;
+        bool pop_rbp = (prev == XED_ICLASS_POP &&
+                        xed_decoded_inst_get_reg(insns[i - 1], XED_OPERAND_REG0) == XED_REG_RBP);
+        if (!pop_rbp && prev != XED_ICLASS_LEAVE)
+          epilogue_ok = false;
+      }
+      if ((iclass == XED_ICLASS_POP && xed_decoded_inst_get_reg(x, XED_OPERAND_REG0) == XED_REG_RBP) ||
+          iclass == XED_ICLASS_LEAVE) {
+        if (i + 1 >= n || xed_decoded_inst_get_iclass(insns[i + 1]) != XED_ICLASS_RET_NEAR)
+          epilogue_ok = false;
+        epilogues.push_back(addrs[i]);
+      }
 
       // Is it 'mov [rbp+disp], reg' (a spill of reg)?
       if (iclass == XED_ICLASS_MOV && xed_decoded_inst_number_of_memory_operands(x) == 1 &&
@@ -2943,6 +2981,16 @@ static void analyze_promotable_slots(ADDRINT rtn_addr, USIZE rtn_size,
       else if (touches[r] == 1 && spill_of.count(r))
         pr.coalesce[spill_of[r]] = r;
     }
+    static const xed_reg_enum_t callee_saved_pool[] = {
+      XED_REG_RBX, XED_REG_R12, XED_REG_R13, XED_REG_R14, XED_REG_R15
+    };
+    pr.prologue_addr = addrs[1];
+    if (epilogue_ok && !epilogues.empty()) {
+      pr.epilogue_addrs = epilogues;
+      for (unsigned k = 0; k < sizeof(callee_saved_pool) / sizeof(callee_saved_pool[0]); k++)
+        if (!touches.count(callee_saved_pool[k]))
+          pr.callee_saved.push_back(callee_saved_pool[k]);
+    }
 
     for (std::map<INT64, promo_slot_t>::iterator it = slots.begin(); it != slots.end(); ++it) {
       promo_slot_t &s = it->second;
@@ -3009,6 +3057,8 @@ static void select_promoted_slots(const instr_map_t *tc_map, unsigned tc_entries
 
       unsigned next_reg = 0;
       bool any = false;
+      std::set<INT64> promoted_disps;
+      std::vector<INT64> save_areas;          // promoted 8 bytes slots: free stack memory
       for (unsigned o = 0; o < order.size(); o++) {
         const promo_slot_t &slot = pr.slots[order[o].second];
         bool coalesced = pr.coalesce.count(slot.disp) > 0;
@@ -3022,6 +3072,10 @@ static void select_promoted_slots(const instr_map_t *tc_map, unsigned tc_entries
           const instr_map_t &e = tc_map[entry_of[slot.accesses[a]]];
           ok = promo_rewrite(reinterpret_cast<const UINT8 *>(e.encoded_ins), reg,
                              encs[a].encoded_ins, &encs[a].size);
+          if (!ok && KnobDumpPromo) {
+            cerr << "   cannot rewrite: ";
+            dump_instr_from_mem((ADDRINT *)e.encoded_ins, slot.accesses[a]);
+          }
         }
         if (KnobDumpPromo)
           cerr << "promo rtn 0x" << hex << pr.rtn_addr << " slot [rbp" << dec << slot.disp
@@ -3030,12 +3084,64 @@ static void select_promoted_slots(const instr_map_t *tc_map, unsigned tc_entries
                << xed_reg_enum_t2str(promo_sub_reg(reg, slot.width)) << endl;
         if (!ok)
           continue;
-        for (unsigned a = 0; a < slot.accesses.size(); a++)
+        for (unsigned a = 0; a < slot.accesses.size(); a++) {
           promoted_access[slot.accesses[a]] = encs[a];
+          if (KnobDumpPromo) {
+            const instr_map_t &e = tc_map[entry_of[slot.accesses[a]]];
+            cerr << "   0x" << hex << slot.accesses[a] << dec << ": ";
+            dump_instr_from_mem((ADDRINT *)e.encoded_ins, slot.accesses[a]);
+            cerr << "      -> ";
+            dump_instr_from_mem((ADDRINT *)encs[a].encoded_ins, slot.accesses[a]);
+          }
+        }
         if (!coalesced)
           next_reg++;
         num_promoted_slots++;
         any = true;
+        promoted_disps.insert(slot.disp);
+        if (slot.width == 8)
+          save_areas.push_back(slot.disp);
+      }
+
+      // 2nd pass: callee-saved registers for the remaining slots.
+      unsigned next_cs = 0;
+      for (unsigned o = 0; o < order.size(); o++) {
+        const promo_slot_t &slot = pr.slots[order[o].second];
+        if (promoted_disps.count(slot.disp))
+          continue;
+        if (next_cs >= pr.callee_saved.size() || save_areas.empty())
+          break;
+        xed_reg_enum_t reg = pr.callee_saved[next_cs];
+        std::vector<promoted_access_t> encs(slot.accesses.size());
+        bool ok = true;
+        for (unsigned a = 0; a < slot.accesses.size() && ok; a++) {
+          const instr_map_t &e = tc_map[entry_of[slot.accesses[a]]];
+          ok = promo_rewrite(reinterpret_cast<const UINT8 *>(e.encoded_ins), reg,
+                             encs[a].encoded_ins, &encs[a].size);
+        }
+        if (KnobDumpPromo)
+          cerr << "promo rtn 0x" << hex << pr.rtn_addr << " slot [rbp" << dec << slot.disp
+               << "] width " << slot.width << " weight " << order[o].first
+               << (ok ? " -> " : " rewrite failed ")
+               << xed_reg_enum_t2str(promo_sub_reg(reg, slot.width))
+               << " (callee-saved, saved at [rbp" << save_areas.back() << "])" << endl;
+        if (!ok)
+          continue;
+        for (unsigned a = 0; a < slot.accesses.size(); a++)
+          promoted_access[slot.accesses[a]] = encs[a];
+        promo_save_t sv;
+        sv.reg = reg;
+        sv.save_disp = save_areas.back();
+        save_areas.pop_back();
+        promo_saves_after[pr.prologue_addr].push_back(sv);
+        for (unsigned k = 0; k < pr.epilogue_addrs.size(); k++)
+          promo_restores_before[pr.epilogue_addrs[k]].push_back(sv);
+        promoted_disps.insert(slot.disp);
+        if (slot.width == 8)
+          save_areas.push_back(slot.disp);
+        next_cs++;
+        num_promoted_slots++;
+        num_callee_saved_regs++;
       }
       if (any)
         num_promoted_rtns++;
@@ -3349,7 +3455,22 @@ void create_tc2_thread_func(void *v)
         if (dropped_in_tc2(src))
             continue;
 
-        // 3. Register promotion: access to a promoted stack slot.
+        // 3a. Register promotion: restore the callee-saved registers before
+        //     the epilogue ('pop rbp' / 'leave'). The restores take the key
+        //     of the epilogue instr: a branch to the epilogue runs them too.
+        if (promo_restores_before.count(src.orig_ins_addr)) {
+            const std::vector<promo_save_t> &v = promo_restores_before[src.orig_ins_addr];
+            for (unsigned k = 0; k < v.size(); k++) {
+                xed_encoder_instruction_t enc_instr;
+                xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_reg(v[k].reg),
+                          xed_mem_bd(XED_REG_RBP, xed_disp(v[k].save_disp, 32), 64));
+                if (add_new_encoded_instr(src.new_ins_addr, &enc_instr, RegularIns) < 0)
+                    return;
+                instr_map[num_of_instr_map_entries - 1].bbl_num = src.bbl_num;
+            }
+        }
+
+        // 3b. Register promotion: access to a promoted stack slot.
         if (promoted_access.count(src.orig_ins_addr)) {
             instr_map[num_of_instr_map_entries] = src;
             instr_map_t &e = instr_map[num_of_instr_map_entries];
@@ -3367,6 +3488,7 @@ void create_tc2_thread_func(void *v)
         // 4. Standard instruction copy.
         if (tc_devirt_sites.count(i))
             devirt_sites[num_of_instr_map_entries] = tc_devirt_sites[i];
+        bool save_after = promo_saves_after.count(src.orig_ins_addr) > 0;
 
         instr_map[num_of_instr_map_entries] = src;
 
@@ -3385,6 +3507,21 @@ void create_tc2_thread_func(void *v)
         instr_map[num_of_instr_map_entries].targ_map_entry = -1;
 
         num_of_instr_map_entries++;
+
+        // Register promotion: save the callee-saved registers after
+        // 'mov rbp, rsp'. (No key: a branch to the next instr skips them.)
+        if (save_after) {
+            const std::vector<promo_save_t> &v = promo_saves_after[src.orig_ins_addr];
+            for (unsigned k = 0; k < v.size(); k++) {
+                xed_encoder_instruction_t enc_instr;
+                xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                          xed_mem_bd(XED_REG_RBP, xed_disp(v[k].save_disp, 32), 64),
+                          xed_reg(v[k].reg));
+                if (add_new_encoded_instr(0, &enc_instr, RegularIns) < 0)
+                    return;
+                instr_map[num_of_instr_map_entries - 1].bbl_num = src.bbl_num;
+            }
+        }
     }
     if (KnobVerbose) cerr << "after modifying instr_map" << endl;
 
@@ -3426,7 +3563,8 @@ void create_tc2_thread_func(void *v)
            << " inlined calls=" << num_inlined_calls
            << " const props=" << num_constant_propagations << "\n"
            << "TC2 stats: promoted slots=" << num_promoted_slots << " in " << num_promoted_rtns
-           << " rtns, rewritten accesses=" << num_register_promotions << "\n";
+           << " rtns (" << num_callee_saved_regs << " in callee-saved regs), rewritten accesses="
+           << num_register_promotions << "\n";
     }
 
     // Step 3: Chaining - calculate direct branch and call instructions to point

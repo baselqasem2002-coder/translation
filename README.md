@@ -1,3 +1,9 @@
+> **Note:** the project pintool is in [`src/`](src/) (`src/project.cpp`,
+> see `src/README.txt`). The files below in the repository root
+> (`project.cpp`, `tc_dispatch.h`, `tests/`) are the earlier dispatch-slot
+> skeleton and are not used by it. `test-harness/` has a Pin-less test
+> harness and regression tests.
+
 # translation — `project.so` (Pin, probe mode)
 
 A skeleton for the 2026 project pintool. It profiles the program in **TC1**

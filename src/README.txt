@@ -1,5 +1,5 @@
 ========================================================================
-Exercise 4 - Optimized bprofile Pintool
+Project 2026 - project.so: profile-guided TC2 optimizer (Pin probe mode)
 ========================================================================
 
 a. Names + ID numbers
@@ -8,211 +8,161 @@ Shadi Najar    213557143
 Basel Qassem   324937036
 
 
-b. How to run the tool
+b. Compilation command
 ------------------------------------------------------------------------
-Build:
+From this 'src' directory (Pin 4.0 kit):
 
-    make PIN_ROOT=<path-to-pin-kit> obj-intel64/bprofile.so
+    make PIN_ROOT=<path-to-pin-kit> obj-intel64/project.so
 
-(Alternatively, place the src directory under
- <pin-kit>/source/tools/ and run 'make'.)
-
-Run:
-
-    <path-to-pin-kit>/pin -t obj-intel64/bprofile.so \
-        -prof_time <profiling interval in seconds> -- <input binary> [args]
-
-The tool translates the routines of the main executable into a
-Translation Cache (TC) together with inlined profiling stubs, collects
-BBL execution counts, fallthrough counts, and indirect-jump target
-counts for prof_time seconds (default: 2), then disables the profiling
-stubs (each stub is overwritten with a jump that bypasses it) and lets
-the program run to completion.
-
-Output: edge-profile.csv in the current directory, one line per
-executed BBL, sorted from hottest to coldest:
-
-    <bbl addr>, <exec count>, <taken count>, <fallthru count>[, <targ addr>, <targ count> ... up to 4]
-
-Useful debug knobs: -verbose, -dump_tc, -dump_orig_code, -no_prof,
--no_tc_commit.
-
-Measuring the required >=5% improvement (item 5) against the provided
-non-optimized bprofile.so, e.g.:
-
-    /usr/bin/time -v <pin> -t obj-intel64/bprofile_orig.so -prof_time 10 -- <binary>
-    /usr/bin/time -v <pin> -t obj-intel64/bprofile.so      -prof_time 10 -- <binary>
-
-and compare elapsed/user/system time and page faults ("Maximum resident
-set size" / "page faults" lines), or:
-
-    perf stat -e cycles <pin> -t obj-intel64/bprofile.so -prof_time 10 -- <binary>
-
-The improvement comes from the profiling interval, so use a prof_time
-long enough for profiling to dominate the run (and an input binary /
-workload that runs at least that long).
+(Or copy the directory to <pin-kit>/source/tools/project and run
+ 'make obj-intel64/project.so' there.)
 
 
-c. What problems we fixed in the pintool and how we chose to fix them
+c. How to run the tool
 ------------------------------------------------------------------------
-1. Translation aborted on the first problematic routine.
-   In find_candidate_rtns_for_tc(), any XED decode failure or
-   translation error caused 'return -1', which aborted the entire
-   translation, so binaries containing a single routine with data
-   embedded in code (or any undecodable bytes) could not be profiled at
-   all. Fix: each routine's starting instr-map index and BBL index are
-   recorded before translating it; on failure the routine's entries are
-   reverted (num_of_instr_map_entries and bbl_num are restored) and we
-   continue with the next routine. The skipped routine simply keeps
-   executing its original, non-translated code.
+    <pin-kit>/pin -t obj-intel64/project.so [-prof_time <sec>] -- <app> [args]
 
-2. Unsafe probed replacement.
-   commit_translated_rtns_to_tc() called RTN_ReplaceProbed() on every
-   routine. For routines that Pin cannot safely probe (too short, or
-   with a jump target inside the first bytes that the probe overwrites)
-   this can crash the application. Fix: check
-   RTN_IsSafeForProbedReplacement() and skip the commit for unsafe
-   routines (they keep running the original code).
+For example:
 
-3. Duplicate routines and PLT stubs.
-   Some binaries expose the same address under more than one routine
-   symbol; translating it twice corrupts the address-based chaining of
-   direct branches (entry_map keeps only the first entry per original
-   address). Fix: a set of already-translated routine addresses is kept
-   and duplicates are skipped. PLT stubs (.plt / .plt.got / .plt.sec)
-   are skipped as well: they contain lazy-binding code that must not be
-   relocated into the TC. As a result, the translated xxx@plt routines
-   end with a jump to the (untranslated) PLT0 resolver at the original
-   address; these jumps are automatically redirected through the
-   jump-to-orig-addr map (rewritten as 'jmp qword ptr [rip+disp]'),
-   which is the tool's standard fallback for branches into
-   non-translated code. This is a visible behavioral difference from
-   the provided tool, which translated .plt itself.
+    <pin-kit>/pin -t obj-intel64/project.so -prof_time 2 -- ./bzip2 -k -f input-long.txt
+    <pin-kit>/pin -t obj-intel64/project.so -prof_time 4 -- ./cc1 200.i -o 200.s
 
-4. Off-by-one bug in the jump-to-original-address map.
-   fix_direct_jmp_or_call_to_orig_addr() incremented
-   jump_to_orig_addr_num BEFORE using it as the new entry index. As a
-   result slot 0 was never used, every new entry was written one slot
-   past the range scanned by the lookup loop, so existing entries were
-   never found again and the map grew by one entry per fixed branch
-   (risking the max_rtn_count overflow abort on large binaries). Fix:
-   allocate the current value as the slot, then increment.
+The only output is the elapsed time of the translated code, including
+the profiling time:
 
-5. Unbounded scan in disable_profiling_in_tc().
-   The while loop that measures the size of a profiling stub could read
-   past the end of instr_map if the very last entry belongs to a stub.
-   Fix: bound the loop by num_of_instr_map_entries.
+     Translated code run (including profiling) took: <sec> seconds
 
-6. Minor: is_targ_map.empty() (a no-op query) replaced with .clear().
-
-7. Dead-register save/restore elimination (item 2 of the exercise).
-   The profiling stubs unconditionally saved and restored the registers
-   they clobber: RAX for every BBL/fallthrough counter stub, and RBX +
-   RCX (each saved/restored in 2 instructions via RAX, since a MOV
-   to/from a 64-bit absolute address is only encodable with RAX) for
-   indirect-jump target stubs. We added a conservative forward liveness
-   scan (isRegDeadAt) over the original instructions that will execute
-   after the stub:
-     - the scan starts at the BBL-terminating instruction for a regular
-       counter stub (the stub runs right before it), and at the
-       instruction following the conditional branch for a fallthrough
-       stub (the stub runs on the fallthrough path);
-     - a read of any sub-register (RAX/EAX/AX/AL/AH) => live;
-     - a full overwrite (64-bit write, or 32-bit write, which
-       zero-extends) before any read => dead; 8/16-bit partial writes
-       neither kill nor read the full register;
-     - the scan stops conservatively (assume live) at any control
-       transfer, syscall or interrupt, at the routine end, or after 64
-       instructions.
-   If a register is provably dead at the stub location, its save and
-   restore instructions are simply not emitted: 2 instructions saved
-   per counter stub (RAX), and up to 2+4+4 = 10 instructions per
-   indirect-jump stub (RAX, RBX, RCX). Since a counter stub executes on
-   every BBL execution during the profiling interval, removing 2 of its
-   6 instructions (including 1 of its 2 stores and avoiding the load in
-   the restore) directly reduces the dynamic instruction count and
-   memory traffic of the instrumented run, which is what yields the
-   >=5% improvement in elapsed/user time and total cycles when measured
-   with a sufficiently long -prof_time. The tool prints how many
-   save/restore instructions were eliminated
-   ("dead-register optimization: eliminated N save/restore
-   instructions...") on stderr.
-
-   Safety notes:
-     - If the indirect jump itself uses RAX/RBX/RCX (as target, base or
-       index register), the scan necessarily classifies that register
-       as live (it starts at the jump), so the stub's internal reload
-       of RAX from rax_mem always sees a valid saved value.
-     - The existing AND instruction in the indirect-target stub still
-       modifies RFLAGS (as in the provided tool). This is safe for the
-       BBL-counter part of the stub before conditional branches because
-       that part only uses MOV/LEA, which do not touch flags; the AND
-       only appears before indirect jumps, which do not read flags.
-
-8. Output format (item 3 of the exercise).
-   dump_profile() was rewritten: instead of dumping annotated
-   disassembly to bprofile.out, it now writes edge-profile.csv in the
-   exercise-3 format, sorted from hottest to coldest by BBL execution
-   count. Per BBL we print its original start address (the first
-   non-profiling instruction of the BBL), the execution count, the
-   taken count, the fallthrough count, and up to 4 (indirect target
-   address, count) pairs. The taken count is derived from the
-   terminator type: for a conditional branch taken = exec - fallthru
-   (the exec counter runs before the branch, the fallthru counter runs
-   only on the not-taken path); for an unconditional branch or ret
-   taken = exec; for BBLs cut only because the next instruction is a
-   jump target, fallthru = exec and taken = 0.
+Knobs:
+    -prof_time <sec>   profiling time in TC before TC2 is built (default 2)
+    -no_devirt         disable de-virtualization
+    -no_reorder        disable code reordering
+    -no_regpromo       disable register promotion
+    -no_unroll         disable loop unrolling
+    -no_inline         disable leaf function inlining
+    -no_constprop      disable constant propagation
+    -stats             print what every TC2 optimization did
+    -dump_promo        print the promoted stack slots and rewritten instrs
+    -dump_prof         write the profile to bprofile.out at exit
+    -verbose, -dump_tc, -dump_tc2, -dump_orig_code, -no_tc_commit
+                       debug knobs of bprofile-with-gearing
 
 
-	Actual Performance Comparison (bzip2 with prof_time 10):
-     - Unoptimized bprofile.so : on average 12.1
-     - Optimized bprofile.so   : on average 11.2
-     - Improvement             : about 7%
-
-d. Large differences between this profile and the exercise-2 profile,
-   and why we think they happen
+How it works
 ------------------------------------------------------------------------
-The output files show two massive differences: Exercise 4 records exponentially
-higher execution counts (billions compared to thousands), but captures far fewer
-unique Basic Blocks (784 compared to 4,166). Here is why this happens:
+1. TC: every routine of the main executable (of at least 120 bytes) is
+   translated into TC with profiling code: a counter for every BBL (a
+   single 'inc [rip+x]' placed before a CMP when the BBL has one, since
+   CMP overwrites the flags; otherwise a flags-free mov/lea/mov stub), a
+   fall-through counter for conditional branches, and a target profile
+   (4 entries, indexed by target & 3) for every indirect jump AND every
+   indirect call.
 
-1. Drastic Difference in Instrumentation Overhead (Execution Counts)
+2. After -prof_time seconds a Pin internal thread turns the profiling
+   off, builds TC2 from the TC instructions (without the profiling code)
+   and applies the optimizations below, then redirects every routine of
+   TC to its TC2 version.
 
-* Exercise 2 JIT Overhead: Exercise 2 uses Pin's standard Just-In-Time (JIT)
-  trace instrumentation. For every single basic block, it inserts a call
-  (BBL_InsertCall) to an analysis function (CountBbl), causing a massive
-  context-switching overhead between the application and the Pin tool for every
-  block executed.
-  
-* Exercise 4 TC & Inlining: Exercise 4 translates the original binary into a
-  custom Translation Cache (TC) and directly inlines the profiling instructions
-  (using X86 assembly like INC operations) into the executable code. This
-  eliminates the context-switching overhead entirely.
-  
-* Exercise 4 Dead-Register Optimization: Furthermore, Exercise 4 performs dead-
-  register liveness analysis (isRegDeadAt). If registers like RAX, RBX, or RCX
-  are provably dead at the instrumentation point, it skips generating the
-  instructions to save and restore them to memory.
-  
-* The Result: Because Exercise 4 has virtually zero overhead compared to
-  Exercise 2, the application runs near its native speed. Within the fixed
-  2-second profiling interval (prof_time), the Ex 4 optimized code can iterate
-  through tight loops hundreds of millions of times, whereas the sluggish Ex 2
-  JIT tool only manages a small fraction of those executions.
+   Race-free switching: the places in TC that are patched while the
+   program runs (every routine head and every profiling stub head) are
+   'jmp +5; jmp rel32'. The rel32 is written first (it is not executed),
+   and then a single byte is changed (jmp +5 -> jmp +0, or directly to
+   the end of a short stub). A one byte store is atomic, so a running
+   thread never executes a half-written instruction.
 
-2. Difference in Code Coverage (Unique Basic Blocks)
+3. TC2 optimizations, in this order:
 
-* Safety Restrictions in Ex 4: Exercise 4 operates in Probe mode and only
-  commits routines to the Translation Cache if Pin considers them safe for
-  probed replacement (RTN_IsSafeForProbedReplacement). Additionally, it
-  explicitly skips PLT stubs (e.g., .plt, .plt.got) and routines that fail to
-  decode or translate. This causes it to "miss" blocks that Exercise 2's JIT
-  compiler safely catches.
- 
-* Time-Interval Constraints: Exercise 4 uses a dedicated thread
-  (start_stop_profile_gathering_thread_func) to run the profiling for a specific
-  interval (e.g., 2 seconds) before disabling the counters by patching the
-  Translation Cache with bypass jumps. Consequently, Ex 4 mostly captures the
-  "hot" core loops of the program running during that specific window, whereas
-  Ex 2 captures the initialization, setup, and teardown phases, resulting in a
-  much wider array of "cold" basic blocks.
+   3.1 De-virtualization (indirect jumps and indirect calls).
+       indirect call site:              indirect jump site:
+         cmp  <target>, HOT               lea  rsp, [rsp-128]  ; red zone
+         jne  MISS                        push rcx
+         call HOT       ; direct, TC2     mov  rcx, <target>
+         jmp  NEXT                        lea  rcx, [rcx-HOT]
+       MISS: (cold BBL)                   jrcxz HIT
+         call <target>  ; original        pop rcx / lea rsp,[rsp+128]
+                                          jmp  <target>        ; original
+                                        HIT:
+                                          pop rcx / lea rsp,[rsp+128]
+                                          jmp  HOT             ; direct, TC2
+       The flags are dead at a call, so the call sequence may change them.
+       The jump sequence does not change the flags (lea/mov/push/pop/
+       jrcxz), which is much cheaper than pushfq/popfq. A de-virtualized
+       jump keeps the hot path inside TC2 (a jump table holds original
+       addresses, so without it execution would leave TC2).
+
+   3.2 Code reordering. Inside every routine: the entry BBL first, then
+       the hot BBLs in their original order, then the cold BBLs. A BBL
+       whose fall-through successor is no longer next gets its
+       conditional branch reversed when the branch target is now next
+       ('jcc T' -> 'jncc F'), or else an added 'jmp F'. At the end,
+       jumps to the next instruction are removed.
+
+   3.3 Loop unrolling. A loop made of a single BBL (ending with a
+       conditional branch to its own start) is unrolled twice; the first
+       copy exits with the reversed condition.
+
+   3.4 Leaf function inlining. A call to a routine of at most 5
+       instructions ending with a plain 'ret', with no branches, calls,
+       push/pop or any use of rsp, is replaced by its instructions.
+
+   3.5 Constant propagation. Inside a BBL, 'mov reg1, imm; ...;
+       mov reg2, reg1' becomes 'mov reg2, imm' while reg1 is unchanged.
+
+   3.6 Register promotion of stack slots. Code compiled without
+       optimization (like bzip2) keeps every local variable in a stack
+       slot [rbp+disp]. In a routine without calls/syscalls/indirect
+       jumps, that starts with 'push rbp; mov rbp, rsp' and does not
+       change rbp, a local slot whose every access is a non-indexed
+       [rbp+disp] operand of the same width (1/2/4/8 bytes), with no
+       overlapping access and no 'lea' of its address, is kept in a
+       register: every 'op ..., [rbp+disp]' is rewritten to
+       'op ..., reg' (same instruction and width, so the same flags).
+       Every rewritten instruction is decoded again and compared with
+       the original; if any access of a slot cannot be rewritten the slot
+       stays in memory. Registers, in order:
+         - an argument register whose only use is its spill into the
+           slot (the slot lives in the register it came in: coalescing),
+         - caller-saved GPRs that the routine never uses,
+         - callee-saved GPRs (rbx, r12-r15) that the routine never uses:
+           saved after 'mov rbp, rsp' into the stack memory of an
+           already promoted 8-byte slot and restored before every
+           'pop rbp' / 'leave'.
+       In bzip2, 10 of the 11 locals of mainGtU (75% of all executed
+       instructions) are promoted.
+
+
+d. Threshold used to distinguish frequently and rarely executed code
+------------------------------------------------------------------------
+All the counts are the ones collected during the -prof_time seconds in
+TC.
+
+* Basic blocks (code reordering): a BBL is FREQUENT (hot) if its
+  execution counter is at least 1 during the profiling, and RARE (cold)
+  if its counter is 0. Cold BBLs are moved to the end of their routine,
+  so the code that really ran is packed together (fewer i-cache lines
+  and fewer taken branches). The miss path of a de-virtualized call has
+  no counter, so it is cold too. A routine is reordered only when a cold
+  BBL lies before a hot one.
+
+* Indirect jump/call targets (de-virtualization): the most frequent
+  target of a site is FREQUENT when it was reached at least 1000 times
+  (DEVIRT_MIN_COUNT) AND it is at least 80% (DEVIRT_MIN_PERCENT) of all
+  the targets profiled at that site. Only then is the site
+  de-virtualized; the other targets (rare) go through the original
+  indirect instruction on the miss path. The hot target must also be
+  translated (in TC2).
+
+* Stack slots (register promotion): the frequency of a slot is the sum
+  of the counters of the BBLs of all its accesses. Slots accessed fewer
+  than 100 times (PROMO_MIN_ACCESSES) are rare and stay in memory; the
+  others get the free registers from the most frequent one down.
+
+* Routines: only routines of at least 120 bytes are translated (small
+  routines gain little and cost a probe each).
+
+
+Files
+------------------------------------------------------------------------
+project.cpp       the pintool
+makefile          standard Pin kit makefile
+makefile.rules    builds obj-intel64/project.so
+README.txt        this file
