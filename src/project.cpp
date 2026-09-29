@@ -76,6 +76,8 @@ extern "C" {
 #include <values.h>
 #include <set>
 #include <map>
+#include <vector>
+#include <algorithm>
 #include <time.h>
 #include <fstream>
 
@@ -107,6 +109,31 @@ KNOB<BOOL> KnobDumpProfile(KNOB_MODE_WRITEONCE,    "pintool",
 
 KNOB<BOOL> KnobNoProfile(KNOB_MODE_WRITEONCE,    "pintool",
     "no_prof", "0", "Do not collect profile information");
+
+// Knobs to switch off single TC2 optimizations (for measurements).
+KNOB<BOOL> KnobNoDevirt(KNOB_MODE_WRITEONCE,    "pintool",
+    "no_devirt", "0", "Disable de-virtualization in TC2");
+
+KNOB<BOOL> KnobNoReorder(KNOB_MODE_WRITEONCE,    "pintool",
+    "no_reorder", "0", "Disable code reordering in TC2");
+
+KNOB<BOOL> KnobNoUnroll(KNOB_MODE_WRITEONCE,    "pintool",
+    "no_unroll", "0", "Disable loop unrolling in TC2");
+
+KNOB<BOOL> KnobNoInline(KNOB_MODE_WRITEONCE,    "pintool",
+    "no_inline", "0", "Disable leaf function inlining in TC2");
+
+KNOB<BOOL> KnobNoConstProp(KNOB_MODE_WRITEONCE,    "pintool",
+    "no_constprop", "0", "Disable constant propagation in TC2");
+
+KNOB<BOOL> KnobNoRegPromo(KNOB_MODE_WRITEONCE,    "pintool",
+    "no_regpromo", "0", "Disable register promotion in TC2");
+
+KNOB<BOOL> KnobDumpPromo(KNOB_MODE_WRITEONCE,    "pintool",
+    "dump_promo", "0", "Dump the register promotion candidates");
+
+KNOB<BOOL> KnobStats(KNOB_MODE_WRITEONCE,    "pintool",
+    "stats", "0", "Print statistics of the TC2 optimizations");
 
 
 /* ===================================================================== */
@@ -172,6 +199,17 @@ instr_map_t *instr_map = NULL;
 unsigned num_of_instr_map_entries = 0;
 unsigned max_ins_count = 0;
 
+// Is this TC entry left out of TC2 (profiling code, NOPs, empty entries)?
+// The NOP at a routine head is kept: it is the target of the TC -> TC2 jump.
+static bool dropped_in_tc2(const instr_map_t &e)
+{
+    if (e.ins_type == ProfilingIns || !e.size)
+      return true;
+    if (e.ins_type == RtnHeadIns && e.xed_category == XED_CATEGORY_WIDENOP)
+      return false;
+    return e.xed_category == XED_CATEGORY_WIDENOP || e.xed_category == XED_CATEGORY_NOP;
+}
+
 #define MAX_TARG_ADDRS 0x3
 
 // Kind of indirect control transfer that terminates a BBL.
@@ -212,9 +250,11 @@ unsigned bbl_num = 0;
 std::map<ADDRINT, unsigned> entry_map;
 
 unsigned max_rtn_count = 0;
+unsigned max_bbl_count = 0;   // number of entries allocated in bbl_map
 
 struct timespec start_running_time;
 struct timespec end_running_time;
+struct timespec tool_start_time;
 
 
 
@@ -274,46 +314,68 @@ static bool get_indirect_target_operand(const xed_decoded_inst_t *xedd,
 }
 
 
+// THRESHOLD for de-virtualization (frequent target):
+//   A site (indirect jmp / indirect call) is de-virtualized when its most
+//   frequent target was reached at least DEVIRT_MIN_COUNT times during the
+//   profiling and covers at least DEVIRT_MIN_PERCENT % of all the targets
+//   seen at that site. Otherwise the site is left as is.
+#define DEVIRT_MIN_COUNT   1000
+#define DEVIRT_MIN_PERCENT 80
+
+// Keys (fake orig_ins_addr values) for new instrs that are branch targets
+// inside TC2 only. They are never real code addresses, and chaining resolves
+// branches to them like to any other entry. Unlike instr_map indices, they
+// stay valid when later passes move or copy entries.
+static ADDRINT next_synthetic_key = 0xFFFF800000000000ULL;
+static ADDRINT new_synthetic_key() { return next_synthetic_key += 0x10; }
+
+// BBL numbers for new cold BBLs created in TC2 (the miss path of a
+// de-virtualized site). They are >= bbl_num, so their profile count is 0.
+static unsigned next_synthetic_bbl = 0;
+
 // Step 0 of create_tc2(): choose the sites to de-virtualize.
-// Must run BEFORE Step 1, while instr_map[].orig_ins_addr still holds the
-// original addresses.
-//   orig_to_tc : original instr address -> its address in TC
-//   sites      : instr_map index of the indirect jmp/call -> hot target (orig addr)
-static void find_devirt_sites(const std::map<ADDRINT, ADDRINT> &orig_to_tc,
+// Runs on the TC map (before the TC2 map is built), where orig_ins_addr
+// still holds the original addresses.
+//   orig_to_tc : original instr address -> TC address of its first instr
+//                that is kept in TC2
+//   sites      : TC instr_map index of the indirect jmp/call -> hot target (orig addr)
+static void find_devirt_sites(const instr_map_t *tc_map, unsigned tc_entries,
+                              const std::map<ADDRINT, ADDRINT> &orig_to_tc,
                               std::map<unsigned, ADDRINT> &sites)
 {
     for (unsigned b = 0; b < bbl_num; b++) {
-      if (bbl_map[b].indirect_kind == NoIndirect || !bbl_map[b].counter)
+      if (bbl_map[b].indirect_kind == NoIndirect)
         continue;
 
       unsigned best = 0;
-      for (unsigned j = 1; j <= MAX_TARG_ADDRS; j++)
+      UINT64 total = 0;
+      for (unsigned j = 0; j <= MAX_TARG_ADDRS; j++) {
+        total += bbl_map[b].targ_count[j];
         if (bbl_map[b].targ_count[j] > bbl_map[b].targ_count[best])
           best = j;
-          
+      }
+      if (!total)
+        continue;
+
       ADDRINT hot_targ = bbl_map[b].targ_addr[best];
       UINT64 hot_count = bbl_map[b].targ_count[best];
-      UINT64 exec_count = bbl_map[b].counter;
-      
-      // CRITICAL FIX: Require a solid sample size (2000 hits) and an 85% ratio 
-      // to prevent false positives from OS thread scheduling variance.
-      if (hot_count < 2000 || (hot_count * 100) < (exec_count * 85)) {
+      if (hot_count < DEVIRT_MIN_COUNT || hot_count * 100 < total * DEVIRT_MIN_PERCENT) {
         num_devirt_skip_rare++;
         continue;
       }
-      
+      if (KnobVerbose)
+        cerr << "devirt site 0x" << hex << bbl_map[b].indirect_site_addr << " hot target 0x"
+             << hot_targ << dec << " " << hot_count << "/" << total << endl;
       if (!orig_to_tc.count(hot_targ)) {
         num_devirt_skip_not_translated++;
         continue;
       }
-      if (hot_targ > 0x7FFFFFFF) {
+      if (hot_targ > 0x7FFFFFFF) {           // must fit in the imm32 of the cmp
         num_devirt_skip_far_targ++;
         continue;
       }
-      
       unsigned site = bbl_map[b].terminating_ins_entry;
-      if (site + 1 >= num_of_instr_map_entries ||
-          instr_map[site].orig_ins_addr != bbl_map[b].indirect_site_addr) {
+      if (site >= tc_entries || tc_map[site].orig_ins_addr != bbl_map[b].indirect_site_addr) {
         num_devirt_skip_other++;
         continue;
       }
@@ -321,126 +383,171 @@ static void find_devirt_sites(const std::map<ADDRINT, ADDRINT> &orig_to_tc,
     }
 }
 
+static int add_devirt_instr(ADDRINT key, xed_encoder_instruction_t *enc_instr,
+                            unsigned bbl, ADDRINT targ_key)
+{
+    if (add_new_encoded_instr(key, enc_instr, RegularIns) < 0)
+      return -1;
+    instr_map_t *e = &instr_map[num_of_instr_map_entries - 1];
+    e->bbl_num = bbl;
+    e->orig_targ_addr = targ_key;   // 0 for non-branches
+    return 0;
+}
 
-// Emit the de-virtualized code for the indirect jmp/call 'site' (see the
-// table above) at the end of the NEW instr_map.
-// 'hot_targ_tc' is the TC address of the hot target: chaining turns it into
-// the TC2 address later. The two branches inside a call sequence (jne miss,
-// jmp done) are returned in 'internal_branches' as (branch entry, target
-// entry) pairs, to be set after chaining.
+// Emit the de-virtualized code of the indirect jmp/call 'site' at the end of
+// the TC2 instr_map. 'site' is the TC2 entry of the indirect instr (its
+// orig_ins_addr is its TC address), 'hot_targ' the original address of the
+// hot target, 'hot_targ_key' its TC address (chaining turns it into TC2),
+// 'next_key' the key of the instr following the site.
+//
+// indirect call:                          indirect jump:
+//     cmp  <targ operand>, hot_targ           lea  rsp, [rsp-128]   ; skip red zone
+//     jne  MISS                               push rcx
+//     call hot_targ (direct, in TC2)          mov  rcx, <targ operand>
+//     jmp  NEXT                               lea  rcx, [rcx-hot_targ]
+//   MISS:  (cold BBL)                         jrcxz HIT              ; rcx == 0: hot target
+//     call <targ operand>  (original)         pop  rcx
+//   NEXT:                                     lea  rsp, [rsp+128]
+//                                             jmp  <targ operand>  (original)
+//                                           HIT:
+//                                             pop  rcx
+//                                             lea  rsp, [rsp+128]
+//                                             jmp  hot_targ (direct, in TC2)
+//
+// At a call the flags are dead (the ABI does not preserve them across a
+// call), so the call sequence may change them. At a jump they may be live:
+// the jump sequence does not change them (lea, mov, push, pop and jrcxz do
+// not write the flags), which is much faster than pushfq/popfq. It moves rsp
+// below the 128 bytes red zone first, so that 'push rcx' cannot overwrite
+// data of a leaf function. No register is changed in both sequences.
 // Returns 1 if emitted, 0 if the form is not supported (the caller then
 // copies the site unchanged), -1 on an encoding error.
-static int emit_devirt_site(const instr_map_t *site, ADDRINT hot_targ, ADDRINT hot_targ_tc,
-                            std::vector<std::pair<unsigned, unsigned> > &internal_branches)
+static int emit_devirt_site(const instr_map_t *site, ADDRINT hot_targ, ADDRINT hot_targ_key,
+                            ADDRINT next_key)
 {
     xed_decoded_inst_t xedd;
     xed_decoded_inst_zero_set_mode(&xedd, &dstate);
     if (xed_decode(&xedd, reinterpret_cast<const UINT8*>(site->encoded_ins), max_inst_len) != XED_ERROR_NONE)
       return 0;
-      
+
     indirect_target_t t;
     if (!get_indirect_target_operand(&xedd, site->orig_ins_addr, &t))
       return 0;
-      
+    if (t.mem_addr_width && t.mem_addr_width != 64)
+      return 0;
+
     bool is_call = (xed_decoded_inst_get_category(&xedd) == XED_CATEGORY_CALL);
+    if (is_call && !next_key)
+      return 0;
+    // The jump sequence moves rsp, so an operand based on rsp would change.
+    if (!is_call && (t.targ_reg == XED_REG_RSP || t.base_reg == XED_REG_RSP ||
+                     t.index_reg == XED_REG_RSP))
+      return 0;
+    if (next_synthetic_bbl + 1 >= max_bbl_count)
+      return 0;
+
     ADDRINT key = site->orig_ins_addr;
+    unsigned bbl = site->bbl_num;
+    unsigned miss_bbl = next_synthetic_bbl++;
+    ADDRINT miss_key = new_synthetic_key();
     xed_encoder_instruction_t enc_instr;
 
-    // 1. PUSHFQ - Save status flags
-    xed_inst0(&enc_instr, dstate, XED_ICLASS_PUSHFQ, 64);
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
+    // The target operand of the site, as the 1st operand of a 64-bit cmp.
+    xed_encoder_operand_t targ_op;
+    if (t.targ_reg != XED_REG_INVALID)
+      targ_op = xed_reg(t.targ_reg);
+    else if (t.base_reg == XED_REG_RIP)
+      targ_op = xed_mem_bd(XED_REG_RIP, xed_disp(0, 32), 64);   // disp fixed later
+    else
+      targ_op = xed_mem_bisd(t.base_reg, t.index_reg, t.scale,
+                             xed_disp(t.disp, t.disp_width ? t.disp_width : 32), 64);
 
-    // 2. PUSH R10 / R11 - Save caller-saved scratch registers
-    xed_inst1(&enc_instr, dstate, XED_ICLASS_PUSH, 64, xed_reg(XED_REG_R10));
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
-    xed_inst1(&enc_instr, dstate, XED_ICLASS_PUSH, 64, xed_reg(XED_REG_R11));
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
+    if (!is_call) {
+      ADDRINT hit_key = new_synthetic_key();
+      xed_inst2(&enc_instr, dstate, XED_ICLASS_LEA, 64, xed_reg(XED_REG_RSP),
+                xed_mem_bd(XED_REG_RSP, xed_disp(-128, 32), 64));
+      if (add_devirt_instr(key, &enc_instr, bbl, 0) < 0) return -1;
+      xed_inst1(&enc_instr, dstate, XED_ICLASS_PUSH, 64, xed_reg(XED_REG_RCX));
+      if (add_devirt_instr(key, &enc_instr, bbl, 0) < 0) return -1;
+      if (t.targ_reg != XED_REG_RCX) {
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_reg(XED_REG_RCX), targ_op);
+        if (add_devirt_instr(key, &enc_instr, bbl, 0) < 0) return -1;
+        if (t.base_reg == XED_REG_RIP)
+          instr_map[num_of_instr_map_entries - 1].orig_rip_addr = site->orig_rip_addr;
+      }
+      xed_inst2(&enc_instr, dstate, XED_ICLASS_LEA, 64, xed_reg(XED_REG_RCX),
+                xed_mem_bd(XED_REG_RCX, xed_disp(-(xed_int64_t)hot_targ, 32), 64));
+      if (add_devirt_instr(key, &enc_instr, bbl, 0) < 0) return -1;
+      xed_inst1(&enc_instr, dstate, XED_ICLASS_JRCXZ, 64, xed_relbr(0, 8));
+      if (add_devirt_instr(key, &enc_instr, bbl, hit_key) < 0) return -1;
 
-    // 3. MOV R10, [Runtime Target]
-    if (t.targ_reg != XED_REG_INVALID) {
-      xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_reg(XED_REG_R10), xed_reg(t.targ_reg));
-    } else if (t.base_reg == XED_REG_RIP) {
-      xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_reg(XED_REG_R10), xed_mem_bd(XED_REG_RIP, xed_disp(0, 32), 64));
-    } else {
-      xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_reg(XED_REG_R10), xed_mem_bisd(t.base_reg, t.index_reg, t.scale, xed_disp(t.disp, t.disp_width), 64));
-    }
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
-    if (t.base_reg == XED_REG_RIP) instr_map[num_of_instr_map_entries - 1].orig_rip_addr = site->orig_rip_addr;
+      // MISS: restore and run the original jump.
+      xed_inst1(&enc_instr, dstate, XED_ICLASS_POP, 64, xed_reg(XED_REG_RCX));
+      if (add_devirt_instr(key, &enc_instr, bbl, 0) < 0) return -1;
+      xed_inst2(&enc_instr, dstate, XED_ICLASS_LEA, 64, xed_reg(XED_REG_RSP),
+                xed_mem_bd(XED_REG_RSP, xed_disp(128, 32), 64));
+      if (add_devirt_instr(key, &enc_instr, bbl, 0) < 0) return -1;
+      instr_map[num_of_instr_map_entries] = *site;
+      instr_map[num_of_instr_map_entries].orig_ins_addr = key;
+      instr_map[num_of_instr_map_entries].ins_type = RegularIns;
+      instr_map[num_of_instr_map_entries].targ_map_entry = -1;
+      instr_map[num_of_instr_map_entries].bbl_num = bbl;
+      num_of_instr_map_entries++;
 
-    // 4. MOV R11, Profiled Hot Target
-    xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_reg(XED_REG_R11), xed_imm0(hot_targ, 64));
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
-
-    // 5. CMP R10, R11
-    xed_inst2(&enc_instr, dstate, XED_ICLASS_CMP, 64, xed_reg(XED_REG_R10), xed_reg(XED_REG_R11));
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
-
-    // 6. JNE Fallback (Miss Path)
-    xed_inst1(&enc_instr, dstate, XED_ICLASS_JNZ, 64, xed_relbr(0, 32));
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
-    unsigned jne_entry = num_of_instr_map_entries - 1;
-
-    // 7. POP R11, R10, RFLAGS (Hit Path)
-    xed_inst1(&enc_instr, dstate, XED_ICLASS_POP, 64, xed_reg(XED_REG_R11));
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
-    xed_inst1(&enc_instr, dstate, XED_ICLASS_POP, 64, xed_reg(XED_REG_R10));
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
-    xed_inst0(&enc_instr, dstate, XED_ICLASS_POPFQ, 64);
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
-
-    // 8. Call / Jmp De-virtualized TC2 Target
-    xed_inst1(&enc_instr, dstate, is_call ? XED_ICLASS_CALL_NEAR : XED_ICLASS_JMP, 64, xed_relbr(0, 32));
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
-    instr_map[num_of_instr_map_entries - 1].orig_targ_addr = hot_targ_tc;
-
-    unsigned jmp_entry = 0;
-    if (is_call) {
-      // 9. JMP done (Skip fallback)
+      // HIT: restore and jump directly.
+      xed_inst1(&enc_instr, dstate, XED_ICLASS_POP, 64, xed_reg(XED_REG_RCX));
+      if (add_devirt_instr(hit_key, &enc_instr, bbl, 0) < 0) return -1;
+      xed_inst2(&enc_instr, dstate, XED_ICLASS_LEA, 64, xed_reg(XED_REG_RSP),
+                xed_mem_bd(XED_REG_RSP, xed_disp(128, 32), 64));
+      if (add_devirt_instr(hit_key, &enc_instr, bbl, 0) < 0) return -1;
       xed_inst1(&enc_instr, dstate, XED_ICLASS_JMP, 64, xed_relbr(0, 32));
-      if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
-      jmp_entry = num_of_instr_map_entries - 1;
+      if (add_devirt_instr(hit_key, &enc_instr, bbl, hot_targ_key) < 0) return -1;
+
+      num_devirt_jumps++;
+      return 1;
     }
 
-    // 10. Fallback Path: POP R11, R10, RFLAGS (Miss Path)
-    unsigned miss_entry = num_of_instr_map_entries;
-    xed_inst1(&enc_instr, dstate, XED_ICLASS_POP, 64, xed_reg(XED_REG_R11));
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
-    xed_inst1(&enc_instr, dstate, XED_ICLASS_POP, 64, xed_reg(XED_REG_R10));
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
-    xed_inst0(&enc_instr, dstate, XED_ICLASS_POPFQ, 64);
-    if (add_new_encoded_instr(key, &enc_instr, RegularIns) < 0) return -1;
+    // Indirect call.
+    xed_inst2(&enc_instr, dstate, XED_ICLASS_CMP, 64, targ_op,
+              xed_simm0((xed_int32_t)hot_targ, 32));
+    if (add_devirt_instr(key, &enc_instr, bbl, 0) < 0) return -1;
+    if (t.base_reg == XED_REG_RIP)
+      instr_map[num_of_instr_map_entries - 1].orig_rip_addr = site->orig_rip_addr;
+    xed_inst1(&enc_instr, dstate, XED_ICLASS_JNZ, 64, xed_relbr(0, 32));
+    if (add_devirt_instr(key, &enc_instr, bbl, miss_key) < 0) return -1;
+    xed_inst1(&enc_instr, dstate, XED_ICLASS_CALL_NEAR, 64, xed_relbr(0, 32));
+    if (add_devirt_instr(key, &enc_instr, bbl, hot_targ_key) < 0) return -1;
+    xed_inst1(&enc_instr, dstate, XED_ICLASS_JMP, 64, xed_relbr(0, 32));
+    if (add_devirt_instr(key, &enc_instr, bbl, next_key) < 0) return -1;
 
-    // 11. Original Instruction
+    // MISS path (a cold BBL): the original indirect call.
     instr_map[num_of_instr_map_entries] = *site;
+    instr_map[num_of_instr_map_entries].orig_ins_addr = miss_key;
+    instr_map[num_of_instr_map_entries].ins_type = RegularIns;
     instr_map[num_of_instr_map_entries].targ_map_entry = -1;
+    instr_map[num_of_instr_map_entries].bbl_num = miss_bbl;
     num_of_instr_map_entries++;
 
-    // Wire up internal branches
-    internal_branches.push_back(std::make_pair(jne_entry, miss_entry));
-    if (is_call) {
-      internal_branches.push_back(std::make_pair(jmp_entry, num_of_instr_map_entries)); // jump over original
+    if (is_call)
       num_devirt_calls++;
-    } else {
+    else
       num_devirt_jumps++;
-    }
-
     return 1;
 }
 
 // Step 1b of create_tc2(): build a new instr_map in which every chosen
-// site is replaced by its de-virtualized code (the other entries are
-// copied as they are). Runs after Step 1, so all orig_ins_addr/orig_targ_addr
-// fields already hold TC addresses and entry indices may change.
+// site (given by its index in the TC2 map) is replaced by its de-virtualized
+// code; the other entries are copied as they are.
+//   hot_keys : original hot target address -> its key in the TC2 map
 static int insert_devirt_sites(const std::map<unsigned, ADDRINT> &sites,
-                               const std::map<ADDRINT, ADDRINT> &orig_to_tc,
-                               std::vector<std::pair<unsigned, unsigned> > &internal_branches)
+                               const std::map<ADDRINT, ADDRINT> &hot_keys)
 {
     if (sites.empty())
       return 0;
 
     instr_map_t *old_map = instr_map;
     unsigned old_num = num_of_instr_map_entries;
-    unsigned extra = 8 * sites.size() + 16;   // at most 4 new entries per site
+    unsigned extra = 16 * sites.size() + 16;   // at most 10 new entries per site
 
     instr_map_t *new_map = (instr_map_t *)calloc(max_ins_count + extra, sizeof(instr_map_t));
     if (new_map == NULL) {
@@ -450,34 +557,24 @@ static int insert_devirt_sites(const std::map<unsigned, ADDRINT> &sites,
     instr_map = new_map;
     max_ins_count += extra;
     num_of_instr_map_entries = 0;
+    next_synthetic_bbl = bbl_num + 1;
 
-    std::vector<unsigned> new_index(old_num + 1);
     for (unsigned i = 0; i < old_num; i++) {
-      new_index[i] = num_of_instr_map_entries;
       std::map<unsigned, ADDRINT>::const_iterator it = sites.find(i);
       if (it != sites.end()) {
-        int rc = emit_devirt_site(&old_map[i], it->second, orig_to_tc.at(it->second),
-                                  internal_branches);
-        if (rc < 0)
-          return -1;
-        if (rc > 0) {
-          // The new entries belong to the BBL of the site.
-          for (unsigned k = new_index[i]; k < num_of_instr_map_entries; k++)
-            instr_map[k].bbl_num = old_map[i].bbl_num;
-          continue;
+        ADDRINT next_key = (i + 1 < old_num) ? old_map[i + 1].orig_ins_addr : 0;
+        unsigned start = num_of_instr_map_entries;
+        int rc = emit_devirt_site(&old_map[i], it->second, hot_keys.at(it->second), next_key);
+        if (rc < 0) {
+          // Undo the partial sequence and keep the site unchanged.
+          num_of_instr_map_entries = start;
+          rc = 0;
         }
+        if (rc > 0)
+          continue;
         num_devirt_skip_other++;             // unsupported form: copy it
       }
       instr_map[num_of_instr_map_entries++] = old_map[i];
-    }
-    new_index[old_num] = num_of_instr_map_entries;
-
-    // Keep the BBL -> instr_map indices valid.
-    for (unsigned b = 0; b < bbl_num; b++) {
-      if (bbl_map[b].starting_ins_entry <= old_num)
-        bbl_map[b].starting_ins_entry = new_index[bbl_map[b].starting_ins_entry];
-      if (bbl_map[b].terminating_ins_entry <= old_num)
-        bbl_map[b].terminating_ins_entry = new_index[bbl_map[b].terminating_ins_entry];
     }
 
     free(old_map);
@@ -580,9 +677,7 @@ static int emit_branch_to_key(xed_iclass_enum_t iclass, ADDRINT targ_key, unsign
 // Step 1c of create_tc2(): reorder the BBLs of every routine (see above).
 // Runs after Step 1/1b (orig_ins_addr fields hold TC addresses, which chaining
 // uses as keys, so moving entries does not break branch targets).
-// 'internal_branches' (entry index pairs of de-virtualized calls) are
-// remapped to the new entry indices.
-static int reorder_bbls(std::vector<std::pair<unsigned, unsigned> > &internal_branches)
+static int reorder_bbls()
 {
     unsigned old_num = num_of_instr_map_entries;
     instr_map_t *old_map = instr_map;
@@ -650,11 +745,18 @@ static int reorder_bbls(std::vector<std::pair<unsigned, unsigned> > &internal_br
       //    can_reorder = false;
       //}
 	  
-      for (unsigned i = bbls[rb].first; i <= bbls[re - 1].last && can_reorder; i++) {
-        if (!old_map[i].size || old_map[i].xed_category != XED_CATEGORY_COND_BR)
-          continue;
-        if (reverse_cond_iclass(entry_iclass(&old_map[i])) == XED_ICLASS_INVALID)
-          can_reorder = false;                    // LOOP / JRCXZ (or unknown)
+      for (unsigned b = rb; b < re && can_reorder; b++) {
+        for (unsigned i = bbls[b].first; i <= bbls[b].last && can_reorder; i++) {
+          if (!old_map[i].size || old_map[i].xed_category != XED_CATEGORY_COND_BR)
+            continue;
+          if (reverse_cond_iclass(entry_iclass(&old_map[i])) != XED_ICLASS_INVALID)
+            continue;
+          // LOOP / JRCXZ (or unknown): fine only inside its own BBL (like
+          // the jrcxz of a de-virtualized jump), which is never split.
+          std::map<ADDRINT, unsigned>::const_iterator t = key_to_bbl.find(old_map[i].orig_targ_addr);
+          if (t == key_to_bbl.end() || t->second != b)
+            can_reorder = false;
+        }
       }
       // Nothing to gain unless a cold BBL sits before a hot one.
       bool cold_before_hot = false;
@@ -728,10 +830,6 @@ static int reorder_bbls(std::vector<std::pair<unsigned, unsigned> > &internal_br
     new_index[old_num] = num_of_instr_map_entries;
 
     // 3. Remap indices that point into instr_map.
-    for (unsigned k = 0; k < internal_branches.size(); k++) {
-      internal_branches[k].first = new_index[internal_branches[k].first];
-      internal_branches[k].second = new_index[internal_branches[k].second];
-    }
     for (unsigned b = 0; b < bbl_num; b++) {
       if (bbl_map[b].starting_ins_entry <= old_num)
         bbl_map[b].starting_ins_entry = new_index[bbl_map[b].starting_ins_entry];
@@ -773,8 +871,12 @@ static int unroll_single_bbl_loops()
             xed_iclass_enum_t cond_iclass = entry_iclass(&instr_map[bbl_end]);
             xed_iclass_enum_t rev_iclass = reverse_cond_iclass(cond_iclass);
 
+            // The exit of the 1st copy jumps to the instr after the loop: it
+            // needs a key (an instr added by the reordering has none).
+            ADDRINT exit_key = (bbl_end + 1 < old_num) ? instr_map[bbl_end + 1].orig_ins_addr : 0;
+
             // Only unroll if we can reverse the condition (ignore LOOP/JRCXZ)
-            if (rev_iclass != XED_ICLASS_INVALID) {
+            if (rev_iclass != XED_ICLASS_INVALID && exit_key) {
                 
                 // --- UNROLL ITERATION 1 ---
                 for (unsigned j = bbl_start; j < bbl_end; j++) {
@@ -782,8 +884,8 @@ static int unroll_single_bbl_loops()
                 }
                 
                 // Replace the jump with the reversed condition, pointing to the fall-through
-                ADDRINT fallthrough_addr = (bbl_end + 1 < old_num) ? instr_map[bbl_end + 1].orig_ins_addr : 0;
-                if (fallthrough_addr) {
+                ADDRINT fallthrough_addr = exit_key;
+                {
                     new_map[new_entries] = instr_map[bbl_end]; // Copy original entry
                     
                     xed_encoder_instruction_t enc_instr;
@@ -835,6 +937,27 @@ static int unroll_single_bbl_loops()
 //Simple Leaf Function Inlining
 unsigned num_inlined_calls = 0;
 
+// Does the instr read or write rsp (explicitly, implicitly or in a memory operand)?
+static bool uses_rsp(const instr_map_t *e)
+{
+    xed_decoded_inst_t xedd;
+    xed_decoded_inst_zero_set_mode(&xedd, &dstate);
+    if (xed_decode(&xedd, reinterpret_cast<const UINT8*>(e->encoded_ins), max_inst_len) != XED_ERROR_NONE)
+      return true;
+    const xed_inst_t *xi = xed_decoded_inst_inst(&xedd);
+    for (unsigned k = 0; k < xed_inst_noperands(xi); k++) {
+      xed_operand_enum_t n = xed_operand_name(xed_inst_operand(xi, k));
+      if (xed_operand_is_register(n) || n == XED_OPERAND_BASE0 || n == XED_OPERAND_BASE1)
+        if (xed_get_largest_enclosing_register(xed_decoded_inst_get_reg(&xedd, n)) == XED_REG_RSP)
+          return true;
+    }
+    for (unsigned m = 0; m < xed_decoded_inst_number_of_memory_operands(&xedd); m++)
+      if (xed_decoded_inst_get_base_reg(&xedd, m) == XED_REG_RSP ||
+          xed_decoded_inst_get_index_reg(&xedd, m) == XED_REG_RSP)
+        return true;
+    return false;
+}
+
 static int inline_leaf_functions()
 {
     unsigned old_num = num_of_instr_map_entries;
@@ -876,7 +999,10 @@ static int inline_leaf_functions()
                     // Abort if the function contains branches, nested calls, or touches the stack
                     if (cat == XED_CATEGORY_CALL || cat == XED_CATEGORY_UNCOND_BR || 
                         cat == XED_CATEGORY_COND_BR || cat == XED_CATEGORY_PUSH || 
-                        cat == XED_CATEGORY_POP || cat == XED_CATEGORY_SYSCALL) {
+                        cat == XED_CATEGORY_POP || cat == XED_CATEGORY_SYSCALL ||
+                        (instr_map[targ_end].size && uses_rsp(&instr_map[targ_end]))) {
+                        // Without the call, rsp is 8 bytes higher in the
+                        // inlined code: stack accesses would be wrong.
                         safe_to_inline = false;
                         break;
                     }
@@ -884,10 +1010,14 @@ static int inline_leaf_functions()
                 }
 
                 // If it's a small leaf function ending in RET, inline it
-                if (safe_to_inline && targ_end < old_num && instr_map[targ_end].xed_category == XED_CATEGORY_RET) {
+                if (safe_to_inline && targ_end < old_num && instr_map[targ_end].xed_category == XED_CATEGORY_RET &&
+                    entry_iclass(&instr_map[targ_end]) == XED_ICLASS_RET_NEAR &&
+                    instr_map[targ_end].size == 1) {      // plain 'ret' (no 'ret imm16')
                     unsigned func_length = targ_end - targ_start;
                     if (func_length <= 5) { // Threshold: Only inline functions with 5 or fewer instructions
                         for (unsigned j = targ_start; j < targ_end; j++) {
+                            if (instr_map[j].xed_category == XED_CATEGORY_WIDENOP)
+                                continue;          // the routine head NOP
                             new_map[new_entries] = instr_map[j];
                             // Strip the original address so the chaining logic ignores the duplicate
                             new_map[new_entries].orig_ins_addr = 0; 
@@ -1012,6 +1142,40 @@ static int apply_constant_propagation()
     }
     return 0;
 }
+
+// Remove unconditional direct jumps whose target is the next instr in the
+// layout (reordering and de-virtualization can leave such jumps).
+unsigned num_removed_jumps = 0;
+
+static void remove_jumps_to_next()
+{
+    std::map<ADDRINT, unsigned> first_entry;       // key -> first entry (as chaining)
+    for (unsigned i = 0; i < num_of_instr_map_entries; i++)
+      if (instr_map[i].orig_ins_addr)
+        first_entry.emplace(instr_map[i].orig_ins_addr, i);
+
+    for (unsigned i = 0; i < num_of_instr_map_entries; i++) {
+      instr_map_t &e = instr_map[i];
+      if (!e.size || e.xed_category != XED_CATEGORY_UNCOND_BR || !e.orig_targ_addr)
+        continue;
+      if (entry_iclass(&e) != XED_ICLASS_JMP)
+        continue;
+      std::map<ADDRINT, unsigned>::const_iterator t = first_entry.find(e.orig_targ_addr);
+      if (t == first_entry.end() || t->second <= i)
+        continue;
+      // Every entry between the jmp and its target must be empty.
+      bool only_empty = true;
+      for (unsigned j = i + 1; j < t->second; j++)
+        if (instr_map[j].size) { only_empty = false; break; }
+      if (!only_empty)
+        continue;
+      // Keep the entry (its key may be a branch target) but make it empty.
+      e.size = 0;
+      e.orig_targ_addr = 0;
+      num_removed_jumps++;
+    }
+}
+
 /* ============================================================= */
 /* Service instr routines                                        */
 /* ============================================================= *///{
@@ -1351,59 +1515,82 @@ int encode_jump_instr(ADDRINT pc, ADDRINT target_addr, char *encoded_jmp_ins)
 }        
 
 
+/********************************************/
+/* Switch heads: race free patching of TC  */
+/********************************************/
+// The places in TC that are patched while the program runs (the head of
+// every routine, and the head of every profiling stub) start with the 7
+// bytes:
+//     EB 05          jmp +5   ; skip the next jmp: the switch is off
+//     E9 <rel32>     jmp target
+// Turning the switch on: first write rel32 (not executed, as it is skipped),
+// then change the single byte 05 to 00. The one byte store is atomic, so a
+// thread running this code sees either the old or the new instruction,
+// never a half written one. (Writing a 5 bytes jmp over a NOP7 while it is
+// executed can crash the program.)
+// If the target is at most 127 bytes after the 'jmp +5' (a short profiling
+// stub), the single byte becomes the distance to the target instead, so a
+// single short jmp skips the whole stub.
+#define SWITCH_HEAD_SIZE 7
+
+// Write a switch head over a NOP of 'size' >= 7 bytes (the bytes after the
+// 7 of the switch become 1 byte NOPs).
+static void write_switch_head(char *p, unsigned size)
+{
+    static const unsigned char head[SWITCH_HEAD_SIZE] = {0xEB, 0x05, 0xE9, 0, 0, 0, 0};
+    memcpy(p, head, SWITCH_HEAD_SIZE);
+    for (unsigned k = SWITCH_HEAD_SIZE; k < size; k++)
+      p[k] = (char)0x90;
+}
+
+static int turn_on_switch_head(ADDRINT head, ADDRINT target)
+{
+    volatile unsigned char *p = (volatile unsigned char *)head;
+    if (p[0] != 0xEB || p[2] != 0xE9)
+      return -1;
+    xed_int64_t short_rel = (xed_int64_t)target - (xed_int64_t)(head + 2);
+    if (short_rel > 5 && short_rel <= 127) {
+      __sync_synchronize();
+      p[1] = (unsigned char)short_rel;   // jmp +5 -> jmp target
+      __sync_synchronize();
+      return 0;
+    }
+    xed_int64_t rel = (xed_int64_t)target - (xed_int64_t)(head + SWITCH_HEAD_SIZE);
+    if (rel > 0x7FFFFFFF || rel < -0x7FFFFFFFLL)
+      return -1;
+    xed_int32_t rel32 = (xed_int32_t)rel;
+    memcpy((void *)(head + 3), &rel32, 4);
+    __sync_synchronize();
+    p[1] = 0x00;                       // jmp +5 -> jmp +0: now jumps to target
+    __sync_synchronize();
+    return 0;
+}
+
 /***************************/
 /* disable_profiling_in_tc */
 /***************************/
 int disable_profiling_in_tc(instr_map_t * instr_map, unsigned num_of_instr_map_entries)
 {
     for (unsigned i = 0; i < num_of_instr_map_entries; i++) {
-        // Check for the case of a NOP instr at the head of a
-        // pofiling code stub and replace it by a jump instr that skips it.
+        // The head of a profiling code stub is a switch (see
+        // write_switch_head()). Set its jump to the end of the stub and
+        // turn it on.
         if (instr_map[i].ins_type == ProfilingIns &&
-            instr_map[i].xed_category == XED_CATEGORY_WIDENOP) {
-            // Calculate the jump displacement.
+            instr_map[i].xed_category == XED_CATEGORY_WIDENOP &&
+            instr_map[i].size >= SWITCH_HEAD_SIZE) {
             unsigned j = 1;
-            xed_int64_t disp = 0;
-            while (instr_map[i+j].ins_type == ProfilingIns) {
-                disp += instr_map[i+j].size;
+            ADDRINT stub_end = instr_map[i].new_ins_addr + instr_map[i].size;
+            while (i + j < num_of_instr_map_entries && instr_map[i+j].ins_type == ProfilingIns) {
+                stub_end += instr_map[i+j].size;
                 j++;
             }
-
-          xed_encoder_instruction_t enc_instr;
-          xed_encoder_request_t enc_req;
-          unsigned int ilen = XED_MAX_INSTRUCTION_BYTES;
-          char encoded_jmp_ins[XED_MAX_INSTRUCTION_BYTES];
-          unsigned int olen = 5; // skip jump instr is exactly 5 bytes long.
-          
-          disp += (instr_map[i].size - olen);
-          xed_inst1(&enc_instr, dstate,  XED_ICLASS_JMP, 64, xed_relbr(disp, 32));
-          
-          xed_encoder_request_zero_set_mode(&enc_req, &dstate);
-          xed_bool_t convert_ok = xed_convert_to_encoder_request(&enc_req, &enc_instr);
-          if (!convert_ok) {
-              cerr << "conversion to encode request failed" << endl;
-              return -1;
-          }           
-          xed_error_enum_t xed_error = xed_encode(&enc_req,
-                    reinterpret_cast<UINT8*>(encoded_jmp_ins), ilen, &olen);
-          if (xed_error != XED_ERROR_NONE) {
-              cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
-            return -1;
-          }
-
-          if (olen > instr_map[i].size) {
-             cerr << " unable to set a relative jump to skip the profiling code stub at: "
-                  << hex << "0x" << instr_map[i].new_ins_addr << "\n";
-             return -1;
-          }
-
-          // Write the bypassing jump instr on the NOP instr.
-          memcpy((ADDRINT *)instr_map[i].new_ins_addr, encoded_jmp_ins, olen);
-          i += (j - 1);
-       }
+            if (turn_on_switch_head(instr_map[i].new_ins_addr, stub_end) < 0)
+                return -1;
+            i += (j - 1);
+        }
     }
     return 0;
-}    
+}
 
 /*************************/
 /* add_new_instr_entry() */
@@ -1850,26 +2037,19 @@ int add_indirect_target_profiling_instrs(INS ins, ADDRINT ins_addr, unsigned cur
     
     xed_encoder_instruction_t enc_instr;
     xed_decoded_inst_t *xedd = INS_XedDec(ins);
-    unsigned memops = xed_decoded_inst_number_of_memory_operands(xedd);
-    
-    xed_reg_enum_t base_reg = XED_REG_INVALID;
-    xed_reg_enum_t index_reg = XED_REG_INVALID;
-    xed_int64_t disp = 0;
-    xed_uint_t scale = 1;
-    xed_uint_t width = 0;
-    unsigned mem_addr_width = 64;
-    xed_reg_enum_t targ_reg = XED_REG_INVALID;
 
-    if (memops) {
-        base_reg = xed_decoded_inst_get_base_reg(xedd, 0);
-        index_reg = xed_decoded_inst_get_index_reg(xedd, 0);
-        disp = xed_decoded_inst_get_memory_displacement(xedd, 0);
-        scale = xed_decoded_inst_get_scale(xedd, 0);
-        width = xed_decoded_inst_get_memory_displacement_width_bits(xedd, 0);
-        mem_addr_width = xed_decoded_inst_get_memop_address_width(xedd, 0);
-    } else {
-        targ_reg = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
-    }
+    // Where does the instr take its target from? (Do not use the number of
+    // memory operands: 'call reg' has one, the push of the return address.)
+    indirect_target_t t;
+    if (!get_indirect_target_operand(xedd, ins_addr, &t))
+        return 0;                       // e.g. far jmp/call: not profiled
+    xed_reg_enum_t base_reg = t.base_reg;
+    xed_reg_enum_t index_reg = t.index_reg;
+    xed_int64_t disp = t.disp;
+    xed_uint_t scale = t.scale;
+    xed_uint_t width = t.disp_width ? t.disp_width : 32;
+    unsigned mem_addr_width = t.mem_addr_width ? t.mem_addr_width : 64;
+    xed_reg_enum_t targ_reg = t.targ_reg;
 
     xed_inst0(&enc_instr, dstate, XED_ICLASS_NOP7, 64);
     if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0) return -1;
@@ -1891,17 +2071,26 @@ int add_indirect_target_profiling_instrs(INS ins, ADDRINT ins_addr, unsigned cur
     }
 
     if (base_reg == XED_REG_RIP) {
-        const unsigned orig_size = xed_decoded_inst_get_length(xedd);
-        const xed_int64_t absolute_mem_addr = ins_addr + disp + orig_size;
-        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_reg(XED_REG_RAX), xed_mem_bisd(XED_REG_INVALID, index_reg, scale, xed_disp(absolute_mem_addr, 32), mem_addr_width));
+        // mov rax, [rip+disp]: the displacement is fixed like any other
+        // rip-relative operand (from orig_rip_addr).
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_reg(XED_REG_RAX),
+                  xed_mem_bd(XED_REG_RIP, xed_disp(0, 32), 64));
+        if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0) return -1;
+        instr_map[num_of_instr_map_entries - 1].orig_rip_addr = t.rip_mem_addr;
     } else if (targ_reg != XED_REG_RAX) {
         xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_reg(XED_REG_RAX), (targ_reg != XED_REG_INVALID ? xed_reg(targ_reg) : xed_mem_bisd(base_reg, index_reg, scale, xed_disp(disp, width), mem_addr_width)));
+        if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0) return -1;
     }
-    if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0) return -1;
 
     xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_reg(XED_REG_RBX), xed_reg(XED_REG_RAX));
     if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0) return -1;
 
+    // Save the flags (AND changes them). Move rsp below the 128 bytes red
+    // zone first: a leaf function may keep its locals there, and pushfq
+    // would overwrite them.
+    xed_inst2(&enc_instr, dstate, XED_ICLASS_LEA, 64, xed_reg(XED_REG_RSP),
+              xed_mem_bd(XED_REG_RSP, xed_disp(-128, 32), 64));
+    if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0) return -1;
     xed_inst0(&enc_instr, dstate, XED_ICLASS_PUSHFQ, 64);
     if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0) return -1;
     xed_inst2(&enc_instr, dstate, XED_ICLASS_AND, 64, xed_reg(XED_REG_RAX), xed_imm0(MAX_TARG_ADDRS, 8));
@@ -1919,6 +2108,9 @@ int add_indirect_target_profiling_instrs(INS ins, ADDRINT ins_addr, unsigned cur
     xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_mem_bisd(XED_REG_RBX, XED_REG_RAX, 8, xed_disp(0, 32), 64), xed_reg(XED_REG_RCX));
     if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0) return -1;
     xed_inst0(&enc_instr, dstate, XED_ICLASS_POPFQ, 64);
+    if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0) return -1;
+    xed_inst2(&enc_instr, dstate, XED_ICLASS_LEA, 64, xed_reg(XED_REG_RSP),
+              xed_mem_bd(XED_REG_RSP, xed_disp(128, 32), 64));
     if (add_new_encoded_instr(ins_addr, &enc_instr, ProfilingIns) < 0) return -1;
 
     xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_reg(XED_REG_RAX), xed_mem_bd(XED_REG_INVALID, xed_disp((ADDRINT)&saved_indirect_rcx, 64), 64));
@@ -2398,138 +2590,458 @@ static bool IsCandidateRtnForTranslation(RTN rtn, ADDRINT& last_selected_rtn_end
 }
 
 
-// --- BEGIN REGISTER PROMOTION ANALYSIS ---
-struct regcache_candidate_t {
-    bool use_rdx; bool use_rcx;
-    ADDRINT spill_rdx_addr; ADDRINT spill_rcx_addr;
-    INT64 rdx_disp; INT64 rcx_disp;
-    std::set<ADDRINT> rdx_loads; std::set<ADDRINT> rcx_loads;
-    regcache_candidate_t() : use_rdx(false), use_rcx(false), spill_rdx_addr(0), spill_rcx_addr(0), rdx_disp(0), rcx_disp(0) {}
+/* ============================================================= */
+/* Optimization: Register Promotion of stack slots               */
+/* ============================================================= */
+//
+// Code compiled without optimizations (like bzip2) keeps every local
+// variable in a stack slot [rbp+disp] and loads/stores it at every use.
+// In a routine that does not call other routines, a local variable slot
+// can live in a free caller-saved register instead: every access
+// 'op ..., [rbp+disp]' is rewritten to 'op ..., reg' (same instr, same
+// width, same flags).
+//
+// A routine is a candidate when (checked on the original code):
+//   - it starts with 'push rbp; mov rbp, rsp' and does not change rbp later
+//     (except 'pop rbp' / 'leave' at the exits),
+//   - it has no call, syscall, interrupt or indirect jump (control never
+//     leaves the routine, except by 'ret'), and all its direct branches
+//     target the routine itself,
+//   - it has no explicit rsp-based memory operand.
+// A stack slot [rbp+disp] (disp < 0) is a candidate when
+//   - every access to it is a non-indexed [rbp+disp] operand of the same
+//     width (1/2/4/8 bytes) in an instr whose memory operand can be
+//     replaced by a register,
+//   - no other access overlaps it and its address is not taken
+//     ('lea reg, [rbp+d]' with d <= disp).
+// The free registers are the caller-saved GPRs that the routine never
+// reads or writes (implicitly or explicitly). A caller-saved GPR whose only
+// use is the spill of an argument 'mov [rbp+disp], reg' (in the prologue)
+// holds that slot from the routine entry on, so the slot can stay in it
+// (coalescing) without using a free register.
+//
+// THRESHOLD: at TC2 generation the slots of each routine are ordered by
+// their profiled number of accesses (sum of the BBL counters of their
+// accesses). The hottest slots get the free registers, as long as a slot
+// was accessed at least PROMO_MIN_ACCESSES times during the profiling.
+
+#define PROMO_MIN_ACCESSES 100
+
+typedef struct {
+    INT64 disp;
+    unsigned width;                   // bytes
+    std::vector<ADDRINT> accesses;    // original addresses of the accessing instrs
+} promo_slot_t;
+
+typedef struct {
+    ADDRINT rtn_addr;
+    std::vector<xed_reg_enum_t> free_regs;   // 64-bit names, in order of preference
+    std::map<INT64, xed_reg_enum_t> coalesce; // slot disp -> the arg reg spilled into it
+    std::vector<promo_slot_t> slots;
+} promo_rtn_t;
+
+typedef struct {
+    UINT8 encoded_ins[XED_MAX_INSTRUCTION_BYTES];
+    unsigned size;
+} promoted_access_t;
+
+static std::vector<promo_rtn_t> promo_rtns;                   // filled at TC generation
+static std::map<ADDRINT, promoted_access_t> promoted_access;  // orig addr -> new encoding
+unsigned num_promoted_slots = 0;
+unsigned num_promoted_rtns = 0;
+unsigned num_register_promotions = 0;
+
+// Caller-saved GPRs that may hold a promoted slot, in order of preference.
+static const xed_reg_enum_t promo_reg_pool[] = {
+    XED_REG_R11, XED_REG_R10, XED_REG_R9, XED_REG_R8,
+    XED_REG_RDI, XED_REG_RSI, XED_REG_RCX, XED_REG_RDX
 };
 
-static std::map<ADDRINT, regcache_candidate_t> regcache_candidates;
-
-static bool insTouchesFullReg(INS ins, REG full_reg) {
-    for (UINT32 i = 0; i < INS_MaxNumRRegs(ins); i++) {
-        REG r = INS_RegR(ins, i);
-        if (REG_valid(r) && REG_FullRegName(r) == full_reg) return true;
-    }
-    for (UINT32 i = 0; i < INS_MaxNumWRegs(ins); i++) {
-        REG r = INS_RegW(ins, i);
-        if (REG_valid(r) && REG_FullRegName(r) == full_reg) return true;
-    }
-    return false;
+// The 'width' bytes part of a 64-bit GPR of promo_reg_pool.
+static xed_reg_enum_t promo_sub_reg(xed_reg_enum_t r64, unsigned width)
+{
+    static const xed_reg_enum_t tab[][4] = {
+      {XED_REG_R11B, XED_REG_R11W, XED_REG_R11D, XED_REG_R11},
+      {XED_REG_R10B, XED_REG_R10W, XED_REG_R10D, XED_REG_R10},
+      {XED_REG_R9B,  XED_REG_R9W,  XED_REG_R9D,  XED_REG_R9},
+      {XED_REG_R8B,  XED_REG_R8W,  XED_REG_R8D,  XED_REG_R8},
+      {XED_REG_DIL,  XED_REG_DI,   XED_REG_EDI,  XED_REG_RDI},
+      {XED_REG_SIL,  XED_REG_SI,   XED_REG_ESI,  XED_REG_RSI},
+      {XED_REG_CL,   XED_REG_CX,   XED_REG_ECX,  XED_REG_RCX},
+      {XED_REG_DL,   XED_REG_DX,   XED_REG_EDX,  XED_REG_RDX},
+    };
+    int w = (width == 1) ? 0 : (width == 2) ? 1 : (width == 4) ? 2 : (width == 8) ? 3 : -1;
+    if (w < 0)
+      return XED_REG_INVALID;
+    for (unsigned i = 0; i < sizeof(tab) / sizeof(tab[0]); i++)
+      if (tab[i][3] == r64)
+        return tab[i][w];
+    return XED_REG_INVALID;
 }
 
-static bool isSimpleRbpSlotOperand(INS ins, UINT32 op, INT64 *disp) {
-    if (op >= INS_OperandCount(ins) || !INS_OperandIsMemory(ins, op)) return false;
-    const REG base = INS_OperandMemoryBaseReg(ins, op);
-    const REG index = INS_OperandMemoryIndexReg(ins, op);
-    if (!REG_valid(base) || REG_FullRegName(base) != LEVEL_BASE::REG_RBP) return false;
-    if (REG_valid(index)) return false;
-    if (disp) *disp = static_cast<INT64>(INS_OperandMemoryDisplacement(ins, op));
-    return true;
-}
-
-static bool isMovStoreArgToRbpSlot(INS ins, REG arg_reg, INT64 *disp) {
-    if (INS_Opcode(ins) != XED_ICLASS_MOV || INS_OperandCount(ins) < 2) return false;
-    if (!INS_OperandIsMemory(ins, 0) || !INS_OperandIsReg(ins, 1)) return false;
-    const REG src = INS_OperandReg(ins, 1);
-    if (!REG_valid(src) || REG_FullRegName(src) != arg_reg) return false;
-    return isSimpleRbpSlotOperand(ins, 0, disp);
-}
-
-static bool isMovLoadRaxFromRbpSlot(INS ins, INT64 expected_disp) {
-    if (INS_Opcode(ins) != XED_ICLASS_MOV || INS_OperandCount(ins) < 2) return false;
-    if (!INS_OperandIsReg(ins, 0) || !INS_OperandIsMemory(ins, 1)) return false;
-    const REG dst = INS_OperandReg(ins, 0);
-    if (!REG_valid(dst) || REG_FullRegName(dst) != LEVEL_BASE::REG_RAX) return false;
-    INT64 disp = 0;
-    return isSimpleRbpSlotOperand(ins, 1, &disp) && disp == expected_disp;
-}
-
-static bool insReferencesRbpSlot(INS ins, INT64 expected_disp) {
-    const xed_decoded_inst_t *xedd = INS_XedDec(ins);
-    const unsigned memops = xed_decoded_inst_number_of_memory_operands(xedd);
-    for (unsigned m = 0; m < memops; m++) {
-        if (xed_decoded_inst_get_base_reg(xedd, m) != XED_REG_RBP) continue;
-        if (xed_decoded_inst_get_index_reg(xedd, m) != XED_REG_INVALID) continue;
-        if ((INT64)xed_decoded_inst_get_memory_displacement(xedd, m) == expected_disp) return true;
-    }
-    return false;
-}
-
-static bool analyzePromotableArgSlot(const std::vector<INS>& insns, REG arg_reg, ADDRINT *spill_addr, INT64 *slot_disp, std::set<ADDRINT> *loads) {
-    bool found_spill = false;
-    ADDRINT local_spill = 0;
-    INT64 local_disp = 0;
-
-    for (unsigned i = 0; i < insns.size(); i++) {
-        INT64 disp = 0;
-        if (!isMovStoreArgToRbpSlot(insns[i], arg_reg, &disp)) continue;
-        if (found_spill) return false; 
-        found_spill = true;
-        local_spill = INS_Address(insns[i]);
-        local_disp = disp;
-    }
-    if (!found_spill) return false;
-
-    bool seen_spill = false;
-    std::set<ADDRINT> local_loads;
-    for (unsigned i = 0; i < insns.size(); i++) {
-        INS ins = insns[i];
-        if (!insReferencesRbpSlot(ins, local_disp)) continue;
-
-        const ADDRINT addr = INS_Address(ins);
-        if (addr == local_spill) {
-            if (seen_spill) return false;
-            seen_spill = true;
-            continue;
-        }
-
-        if (!seen_spill || !isMovLoadRaxFromRbpSlot(ins, local_disp)) return false;
-        local_loads.insert(addr);
-    }
-
-    if (local_loads.size() < 4) return false;
-
-    *spill_addr = local_spill;
-    *slot_disp = local_disp;
-    *loads = local_loads;
-    return true;
-}
-
-static void analyzeRegisterPromotionCandidate(RTN rtn) {
-    std::vector<INS> insns;
-    bool unsafe = false;
-
-    for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins)) {
-        insns.push_back(ins);
-        if (insTouchesFullReg(ins, LEVEL_BASE::REG_R10) || insTouchesFullReg(ins, LEVEL_BASE::REG_R11) ||
-            INS_IsCall(ins) || INS_IsSyscall(ins) || INS_IsInterrupt(ins)) {
-            unsafe = true;
-        }
-    }
-
-    regcache_candidate_t cand;
-    if (!unsafe && !insns.empty()) {
-        cand.use_rdx = analyzePromotableArgSlot(insns, LEVEL_BASE::REG_RDX, &cand.spill_rdx_addr, &cand.rdx_disp, &cand.rdx_loads);
-        cand.use_rcx = analyzePromotableArgSlot(insns, LEVEL_BASE::REG_RCX, &cand.spill_rcx_addr, &cand.rcx_disp, &cand.rcx_loads);
-    }
-
-    if (cand.use_rdx || cand.use_rcx) {
-        regcache_candidates[RTN_Address(rtn)] = cand;
+// Instrs whose [mem] operand can be replaced by a register of the same width.
+static bool promo_iclass_ok(xed_iclass_enum_t c)
+{
+    switch (c) {
+      case XED_ICLASS_MOV:   case XED_ICLASS_ADD:  case XED_ICLASS_SUB:
+      case XED_ICLASS_AND:   case XED_ICLASS_OR:   case XED_ICLASS_XOR:
+      case XED_ICLASS_CMP:   case XED_ICLASS_TEST: case XED_ICLASS_ADC:
+      case XED_ICLASS_SBB:   case XED_ICLASS_INC:  case XED_ICLASS_DEC:
+      case XED_ICLASS_NEG:   case XED_ICLASS_NOT:  case XED_ICLASS_IMUL:
+      case XED_ICLASS_SHL:   case XED_ICLASS_SHR:  case XED_ICLASS_SAR:
+      case XED_ICLASS_MOVZX: case XED_ICLASS_MOVSX: case XED_ICLASS_MOVSXD:
+      case XED_ICLASS_CVTSI2SD: case XED_ICLASS_CVTSI2SS:
+        return true;
+      default:
+        return false;
     }
 }
 
-static int add_tc2_reg_move(ADDRINT new_ins_addr, xed_reg_enum_t dst, xed_reg_enum_t src_reg, unsigned bbl_num) {
+static bool is_flags_reg(xed_reg_enum_t r)
+{
+    return r == XED_REG_FLAGS || r == XED_REG_EFLAGS || r == XED_REG_RFLAGS;
+}
+
+// Non-memory operands of a decoded instr, in order: registers (explicit and
+// implicit, except flags) and immediates. The memory operand appears as
+// 'mem_as' (a register), so the operands of 'op [slot]' and of the rewritten
+// 'op reg' can be compared.
+static void promo_operand_sig(const xed_decoded_inst_t *xedd, xed_reg_enum_t mem_as,
+                              std::vector<UINT64> &sig)
+{
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    for (unsigned k = 0; k < xed_inst_noperands(xi); k++) {
+      const xed_operand_t *op = xed_inst_operand(xi, k);
+      xed_operand_enum_t n = xed_operand_name(op);
+      UINT64 rw = (xed_operand_read(op) ? 1 : 0) | (xed_operand_written(op) ? 2 : 0);
+      if (n == XED_OPERAND_MEM0) {
+        sig.push_back(((UINT64)mem_as << 8) | rw);
+      } else if (xed_operand_is_register(n)) {
+        xed_reg_enum_t r = xed_decoded_inst_get_reg(xedd, n);
+        if (is_flags_reg(r))
+          continue;
+        sig.push_back(((UINT64)r << 8) | rw);
+      } else if (n == XED_OPERAND_IMM0) {
+        sig.push_back(0xFFFF0000ULL | xed_decoded_inst_get_immediate_width_bits(xedd));
+        sig.push_back(xed_decoded_inst_get_unsigned_immediate(xedd));
+      } else if (n == XED_OPERAND_IMM1) {
+        sig.push_back(0xFFFE0000ULL);
+      }
+    }
+}
+
+// Rewrite 'op ..., [rbp+disp]' (encoded in 'bytes') to use 'reg64' (its
+// sub-register of the operand width) instead of the memory operand.
+// The result is decoded again and compared with the original instr.
+// Returns false if the instr cannot be rewritten.
+static bool promo_rewrite(const UINT8 *bytes, xed_reg_enum_t reg64,
+                          UINT8 *out, unsigned *out_size)
+{
+    xed_decoded_inst_t xedd;
+    xed_decoded_inst_zero_set_mode(&xedd, &dstate);
+    if (xed_decode(&xedd, bytes, XED_MAX_INSTRUCTION_BYTES) != XED_ERROR_NONE)
+      return false;
+    xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(&xedd);
+    if (!promo_iclass_ok(iclass) || xed_decoded_inst_number_of_memory_operands(&xedd) != 1)
+      return false;
+    if (xed_decoded_inst_get_base_reg(&xedd, 0) != XED_REG_RBP ||
+        xed_decoded_inst_get_index_reg(&xedd, 0) != XED_REG_INVALID)
+      return false;
+    xed_reg_enum_t seg = xed_decoded_inst_get_seg_reg(&xedd, 0);
+    if (seg != XED_REG_INVALID && seg != XED_REG_SS && seg != XED_REG_DS)
+      return false;
+    if (xed_operand_values_has_lock_prefix(xed_decoded_inst_operands_const(&xedd)) ||
+        xed_operand_values_has_rep_prefix(xed_decoded_inst_operands_const(&xedd)))
+      return false;
+
+    unsigned width = xed_decoded_inst_get_memory_operand_length(&xedd, 0);
+    xed_reg_enum_t reg = promo_sub_reg(reg64, width);
+    if (reg == XED_REG_INVALID)
+      return false;
+
+    // Build the new instr from the explicit operands.
+    const xed_inst_t *xi = xed_decoded_inst_inst(&xedd);
+    xed_encoder_operand_t ops[XED_ENCODER_OPERANDS_MAX];
+    unsigned nops = 0;
+    bool has_mem = false;
+    for (unsigned k = 0; k < xed_inst_noperands(xi); k++) {
+      const xed_operand_t *op = xed_inst_operand(xi, k);
+      if (xed_operand_operand_visibility(op) != XED_OPVIS_EXPLICIT)
+        continue;
+      xed_operand_enum_t n = xed_operand_name(op);
+      if (nops >= XED_ENCODER_OPERANDS_MAX)
+        return false;
+      if (n == XED_OPERAND_MEM0) {
+        ops[nops++] = xed_reg(reg);
+        has_mem = true;
+      } else if (xed_operand_is_register(n)) {
+        ops[nops++] = xed_reg(xed_decoded_inst_get_reg(&xedd, n));
+      } else if (n == XED_OPERAND_IMM0) {
+        unsigned iw = xed_decoded_inst_get_immediate_width_bits(&xedd);
+        if (xed_decoded_inst_get_immediate_is_signed(&xedd))
+          ops[nops++] = xed_simm0(xed_decoded_inst_get_signed_immediate(&xedd), iw);
+        else
+          ops[nops++] = xed_imm0(xed_decoded_inst_get_unsigned_immediate(&xedd), iw);
+      } else {
+        return false;
+      }
+    }
+    if (!has_mem)
+      return false;
+
     xed_encoder_instruction_t enc_instr;
-    xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64, xed_reg(dst), xed_reg(src_reg));
-    int rc = add_new_encoded_instr(new_ins_addr, &enc_instr, RegularIns);
-    if (rc >= 0) instr_map[num_of_instr_map_entries - 1].bbl_num = bbl_num;
-    return rc;
+    xed_inst(&enc_instr, dstate, iclass, xed_decoded_inst_get_operand_width(&xedd), nops, ops);
+    xed_encoder_request_t enc_req;
+    xed_encoder_request_zero_set_mode(&enc_req, &dstate);
+    if (!xed_convert_to_encoder_request(&enc_req, &enc_instr))
+      return false;
+    unsigned olen = 0;
+    if (xed_encode(&enc_req, out, XED_MAX_INSTRUCTION_BYTES, &olen) != XED_ERROR_NONE)
+      return false;
+
+    // Check: same instr, the memory operand replaced by 'reg'.
+    xed_decoded_inst_t nxedd;
+    xed_decoded_inst_zero_set_mode(&nxedd, &dstate);
+    if (xed_decode(&nxedd, out, olen) != XED_ERROR_NONE)
+      return false;
+    if (xed_decoded_inst_get_iclass(&nxedd) != iclass ||
+        xed_decoded_inst_number_of_memory_operands(&nxedd) != 0 ||
+        xed_decoded_inst_get_operand_width(&nxedd) != xed_decoded_inst_get_operand_width(&xedd))
+      return false;
+    std::vector<UINT64> sig_old, sig_new;
+    promo_operand_sig(&xedd, reg, sig_old);
+    promo_operand_sig(&nxedd, XED_REG_INVALID, sig_new);
+    if (sig_old != sig_new)
+      return false;
+
+    *out_size = olen;
+    return true;
 }
-// --- END REGISTER PROMOTION ANALYSIS ---
+
+// Analyze one routine, given its decoded instrs in address order.
+// Adds a promo_rtn_t to promo_rtns if it has candidate slots.
+static void analyze_promotable_slots(ADDRINT rtn_addr, USIZE rtn_size,
+                                     const std::vector<ADDRINT> &addrs,
+                                     const std::vector<const xed_decoded_inst_t *> &insns)
+{
+    unsigned n = insns.size();
+    if (n < 3)
+      return;
+
+    // Prologue: push rbp; mov rbp, rsp
+    const xed_decoded_inst_t *p0 = insns[0], *p1 = insns[1];
+    if (xed_decoded_inst_get_iclass(p0) != XED_ICLASS_PUSH ||
+        xed_decoded_inst_get_reg(p0, XED_OPERAND_REG0) != XED_REG_RBP)
+      return;
+    if (xed_decoded_inst_get_iclass(p1) != XED_ICLASS_MOV ||
+        xed_decoded_inst_get_reg(p1, XED_OPERAND_REG0) != XED_REG_RBP ||
+        xed_decoded_inst_get_reg(p1, XED_OPERAND_REG1) != XED_REG_RSP)
+      return;
+
+    std::map<xed_reg_enum_t, unsigned> touches;   // full reg -> number of instrs using it
+    std::map<xed_reg_enum_t, INT64> spill_of;     // full reg -> slot, if its only use is a spill
+    std::map<INT64, promo_slot_t> slots;     // disp -> slot
+    std::set<INT64> bad_disps;               // slots that cannot be promoted
+    std::vector<std::pair<INT64, unsigned> > ranges;   // all [rbp+disp] accesses
+    INT64 min_lea_disp = 1;                  // lowest 'lea reg, [rbp+d]' (1 = none)
+
+    for (unsigned i = 0; i < n; i++) {
+      const xed_decoded_inst_t *x = insns[i];
+      xed_category_enum_t cat = xed_decoded_inst_get_category(x);
+      xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(x);
+
+      if (cat == XED_CATEGORY_CALL || cat == XED_CATEGORY_SYSCALL ||
+          cat == XED_CATEGORY_INTERRUPT || cat == XED_CATEGORY_SYSTEM)
+        return;
+      if (cat == XED_CATEGORY_UNCOND_BR || cat == XED_CATEGORY_COND_BR) {
+        if (!xed_decoded_inst_get_branch_displacement_width(x))
+          return;                                          // indirect jump
+        ADDRINT t = addrs[i] + xed_decoded_inst_get_length(x) +
+                    xed_decoded_inst_get_branch_displacement(x);
+        if (t < rtn_addr || t >= rtn_addr + rtn_size)
+          return;                                          // leaves the routine
+      }
+      if (cat == XED_CATEGORY_RET && iclass != XED_ICLASS_RET_NEAR)
+        return;
+
+      // Is it 'mov [rbp+disp], reg' (a spill of reg)?
+      if (iclass == XED_ICLASS_MOV && xed_decoded_inst_number_of_memory_operands(x) == 1 &&
+          xed_decoded_inst_mem_written(x, 0) &&
+          xed_decoded_inst_get_base_reg(x, 0) == XED_REG_RBP &&
+          xed_decoded_inst_get_index_reg(x, 0) == XED_REG_INVALID &&
+          xed_operand_name(xed_inst_operand(xed_decoded_inst_inst(x), 1)) == XED_OPERAND_REG0) {
+        xed_reg_enum_t src = xed_decoded_inst_get_reg(x, XED_OPERAND_REG0);
+        spill_of[xed_get_largest_enclosing_register(src)] = xed_decoded_inst_get_memory_displacement(x, 0);
+      }
+
+      // Registers used by the instr.
+      std::set<xed_reg_enum_t> used;
+      const xed_inst_t *xi = xed_decoded_inst_inst(x);
+      for (unsigned k = 0; k < xed_inst_noperands(xi); k++) {
+        const xed_operand_t *op = xed_inst_operand(xi, k);
+        xed_operand_enum_t on = xed_operand_name(op);
+        if (!xed_operand_is_register(on) && on != XED_OPERAND_BASE0 && on != XED_OPERAND_BASE1)
+          continue;
+        xed_reg_enum_t r = xed_decoded_inst_get_reg(x, on);
+        if (r == XED_REG_INVALID)
+          continue;
+        xed_reg_enum_t full = xed_get_largest_enclosing_register(r);
+        used.insert(full);
+        if (full == XED_REG_RBP && xed_operand_written(op) && i != 1 &&
+            iclass != XED_ICLASS_POP && iclass != XED_ICLASS_LEAVE)
+          return;                                          // rbp changes
+      }
+
+      for (std::set<xed_reg_enum_t>::iterator u = used.begin(); u != used.end(); ++u)
+        touches[*u]++;
+
+      // Memory operands.
+      unsigned memops = xed_decoded_inst_number_of_memory_operands(x);
+      bool agen = (iclass == XED_ICLASS_LEA);
+      for (unsigned m = 0; m < memops; m++) {
+        xed_reg_enum_t base = xed_decoded_inst_get_base_reg(x, m);
+        xed_reg_enum_t index = xed_decoded_inst_get_index_reg(x, m);
+        if (base != XED_REG_INVALID) used.insert(xed_get_largest_enclosing_register(base));
+        if (index != XED_REG_INVALID) used.insert(xed_get_largest_enclosing_register(index));
+        if (base == XED_REG_RSP || base == XED_REG_ESP) {
+          if (iclass == XED_ICLASS_PUSH || iclass == XED_ICLASS_POP ||
+              iclass == XED_ICLASS_RET_NEAR || iclass == XED_ICLASS_LEAVE)
+            continue;                                      // implicit stack access
+          return;
+        }
+        if (base != XED_REG_RBP) {
+          if (base == XED_REG_EBP || index == XED_REG_RBP || index == XED_REG_EBP)
+            return;
+          continue;
+        }
+        INT64 disp = xed_decoded_inst_get_memory_displacement(x, m);
+        if (agen) {
+          if (disp < min_lea_disp) min_lea_disp = disp;
+          continue;
+        }
+        if (index != XED_REG_INVALID)
+          continue;                                        // array element
+        unsigned width = xed_decoded_inst_get_memory_operand_length(x, m);
+        ranges.push_back(std::make_pair(disp, width));
+
+        bool ok = (memops == 1 && disp < 0 && promo_iclass_ok(iclass) &&
+                   (width == 1 || width == 2 || width == 4 || width == 8));
+        promo_slot_t &s = slots[disp];
+        if (s.accesses.empty()) { s.disp = disp; s.width = width; }
+        if (!ok || s.width != width)
+          bad_disps.insert(disp);
+        s.accesses.push_back(addrs[i]);
+      }
+    }
+
+    promo_rtn_t pr;
+    pr.rtn_addr = rtn_addr;
+    for (unsigned k = 0; k < sizeof(promo_reg_pool) / sizeof(promo_reg_pool[0]); k++) {
+      xed_reg_enum_t r = promo_reg_pool[k];
+      if (!touches.count(r))
+        pr.free_regs.push_back(r);
+      else if (touches[r] == 1 && spill_of.count(r))
+        pr.coalesce[spill_of[r]] = r;
+    }
+
+    for (std::map<INT64, promo_slot_t>::iterator it = slots.begin(); it != slots.end(); ++it) {
+      promo_slot_t &s = it->second;
+      if (bad_disps.count(s.disp))
+        continue;
+      if (s.disp >= min_lea_disp)
+        continue;                                          // may be reached by a pointer
+      bool overlap = false;
+      for (unsigned r = 0; r < ranges.size() && !overlap; r++) {
+        if (ranges[r].first == s.disp && ranges[r].second == s.width)
+          continue;
+        overlap = (ranges[r].first < s.disp + (INT64)s.width &&
+                   s.disp < ranges[r].first + (INT64)ranges[r].second);
+      }
+      if (!overlap)
+        pr.slots.push_back(s);
+    }
+    // Coalesce only a slot that is a candidate and of the spilled width.
+    std::map<INT64, xed_reg_enum_t> coalesce;
+    for (unsigned k = 0; k < pr.slots.size(); k++)
+      if (pr.coalesce.count(pr.slots[k].disp))
+        coalesce[pr.slots[k].disp] = pr.coalesce[pr.slots[k].disp];
+    pr.coalesce = coalesce;
+    if (!pr.slots.empty() && (!pr.free_regs.empty() || !pr.coalesce.empty()))
+      promo_rtns.push_back(pr);
+}
+
+// At TC2 generation (TC map in 'tc_map'): choose the promoted slots using
+// the profile, and prepare the rewritten encoding of each of their
+// accesses in 'promoted_access'.
+static void select_promoted_slots(const instr_map_t *tc_map, unsigned tc_entries)
+{
+    // original addr -> TC entry of the instr itself (not its profiling code)
+    std::map<ADDRINT, unsigned> entry_of;
+    for (unsigned i = 0; i < tc_entries; i++)
+      if (tc_map[i].ins_type != ProfilingIns && tc_map[i].size &&
+          tc_map[i].xed_category != XED_CATEGORY_WIDENOP)
+        entry_of.emplace(tc_map[i].orig_ins_addr, i);
+
+    for (unsigned r = 0; r < promo_rtns.size(); r++) {
+      promo_rtn_t &pr = promo_rtns[r];
+      if (KnobDumpPromo)
+        cerr << "promo rtn 0x" << hex << pr.rtn_addr << dec << ": " << pr.slots.size()
+             << " candidate slots, " << pr.free_regs.size() << " free regs, "
+             << pr.coalesce.size() << " coalescable" << endl;
+
+      // Profiled number of accesses of every slot.
+      std::vector<std::pair<UINT64, unsigned> > order;   // (weight, slot index)
+      for (unsigned s = 0; s < pr.slots.size(); s++) {
+        UINT64 w = 0;
+        bool all_found = true;
+        for (unsigned a = 0; a < pr.slots[s].accesses.size(); a++) {
+          std::map<ADDRINT, unsigned>::const_iterator it = entry_of.find(pr.slots[s].accesses[a]);
+          if (it == entry_of.end()) { all_found = false; break; }
+          unsigned bbl = tc_map[it->second].bbl_num;
+          if (bbl < bbl_num)
+            w += bbl_map[bbl].counter;
+        }
+        if (all_found && w >= PROMO_MIN_ACCESSES)
+          order.push_back(std::make_pair(w, s));
+      }
+      std::sort(order.begin(), order.end());
+      std::reverse(order.begin(), order.end());
+
+      unsigned next_reg = 0;
+      bool any = false;
+      for (unsigned o = 0; o < order.size(); o++) {
+        const promo_slot_t &slot = pr.slots[order[o].second];
+        bool coalesced = pr.coalesce.count(slot.disp) > 0;
+        if (!coalesced && next_reg >= pr.free_regs.size())
+          continue;
+        xed_reg_enum_t reg = coalesced ? pr.coalesce[slot.disp] : pr.free_regs[next_reg];
+        // Rewrite all the accesses first; promote only if all succeed.
+        std::vector<promoted_access_t> encs(slot.accesses.size());
+        bool ok = true;
+        for (unsigned a = 0; a < slot.accesses.size() && ok; a++) {
+          const instr_map_t &e = tc_map[entry_of[slot.accesses[a]]];
+          ok = promo_rewrite(reinterpret_cast<const UINT8 *>(e.encoded_ins), reg,
+                             encs[a].encoded_ins, &encs[a].size);
+        }
+        if (KnobDumpPromo)
+          cerr << "promo rtn 0x" << hex << pr.rtn_addr << " slot [rbp" << dec << slot.disp
+               << "] width " << slot.width << " weight " << order[o].first
+               << (ok ? " -> " : " rewrite failed ")
+               << xed_reg_enum_t2str(promo_sub_reg(reg, slot.width)) << endl;
+        if (!ok)
+          continue;
+        for (unsigned a = 0; a < slot.accesses.size(); a++)
+          promoted_access[slot.accesses[a]] = encs[a];
+        if (!coalesced)
+          next_reg++;
+        num_promoted_slots++;
+        any = true;
+      }
+      if (any)
+        num_promoted_rtns++;
+    }
+}
+
 
 
 /********************************/
@@ -2603,7 +3115,14 @@ int find_candidate_rtns_for_tc(IMG img)
                         if (add_new_instr_entry(&xedd, b_ins_addr, ins_type) < 0) return -1;
 
                         if (i == 0) bbl_map[current_bbl].starting_ins_entry = num_of_instr_map_entries - 1;
-                        if (is_last) bbl_map[current_bbl].terminating_ins_entry = num_of_instr_map_entries - 1;
+                        if (is_last) {
+                            bbl_map[current_bbl].terminating_ins_entry = num_of_instr_map_entries - 1;
+                            // Remember indirect jmp/call sites for de-virtualization.
+                            if (INS_IsIndirectControlFlow(b_ins) && !INS_IsRet(b_ins)) {
+                                bbl_map[current_bbl].indirect_kind = INS_IsCall(b_ins) ? IndirectCall : IndirectJump;
+                                bbl_map[current_bbl].indirect_site_addr = b_ins_addr;
+                            }
+                        }
                     }
 
                     bbl_num++;
@@ -2616,7 +3135,14 @@ int find_candidate_rtns_for_tc(IMG img)
                     block.clear();
                 }
             }
-			analyzeRegisterPromotionCandidate(rtn);
+            // Register promotion analysis (see select_promoted_slots()).
+            std::vector<ADDRINT> rtn_addrs;
+            std::vector<const xed_decoded_inst_t *> rtn_insns;
+            for (INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins)) {
+                rtn_addrs.push_back(INS_Address(ins));
+                rtn_insns.push_back(INS_XedDec(ins));
+            }
+            analyze_promotable_slots(RTN_Address(rtn), RTN_Size(rtn), rtn_addrs, rtn_insns);
             RTN_Close(rtn);
         }
     }
@@ -2628,20 +3154,27 @@ int find_candidate_rtns_for_tc(IMG img)
 /***************************/
 /* int copy_instrs_to_tc() */
 /***************************/
-int copy_instrs_to_tc(char *tc)
+int copy_instrs_to_tc(char *tc_buf)
 {
     int cursor = 0;
 
     for (unsigned i=0; i < num_of_instr_map_entries; i++) {
 
-      if ((ADDRINT)&tc[cursor] != instr_map[i].new_ins_addr) {
+      if ((ADDRINT)&tc_buf[cursor] != instr_map[i].new_ins_addr) {
           cerr << "ERROR: Non-matching instruction addresses: "
-               << hex << (ADDRINT)&tc[cursor]
+               << hex << (ADDRINT)&tc_buf[cursor]
                << " vs. " << instr_map[i].new_ins_addr << endl;
           return -1;
       }
 
-      memcpy(&tc[cursor], (char *)instr_map[i].encoded_ins, instr_map[i].size);
+      memcpy(&tc_buf[cursor], (char *)instr_map[i].encoded_ins, instr_map[i].size);
+
+      // In TC, the NOP at the head of a routine or of a profiling stub is
+      // a switch that is later turned on without a race.
+      if (tc_buf == tc && instr_map[i].xed_category == XED_CATEGORY_WIDENOP &&
+          instr_map[i].size >= SWITCH_HEAD_SIZE &&
+          (instr_map[i].ins_type == RtnHeadIns || instr_map[i].ins_type == ProfilingIns))
+        write_switch_head(&tc_buf[cursor], instr_map[i].size);
 
       cursor += instr_map[i].size;
     }
@@ -2707,10 +3240,10 @@ void start_stop_profile_gathering_thread_func(void *v)
 {
     // Wait prof_time seconds for the profiling to count
     // execution frequency for each BBL.
-    cerr << " prof time: " << dec << KnobNumSecsDuringProfile << " sec\n";
+    if (KnobVerbose) cerr << " prof time: " << dec << KnobNumSecsDuringProfile << " sec\n";
     sleep(KnobNumSecsDuringProfile);
 
-    cerr << "disabling profile gathering\n";
+    if (KnobVerbose) cerr << "disabling profile gathering\n";
 
     // disable profiling.
     //  Add a jump at beginning of every profile stub to bypass the
@@ -2726,50 +3259,17 @@ void start_stop_profile_gathering_thread_func(void *v)
 int commit_translated_rtns_to_tc2()
 {
   for (unsigned i=0; i < num_of_instr_map_entries; i++) {
-      
-       // Insert a probing jump from routine header in TC to its corresponding 
-       // header in TC2, provided it is a wide NOP instr.
+       // Turn on the switch at the routine head in TC: it jumps to the
+       // routine in TC2 from now on.
        if (instr_map[i].ins_type != RtnHeadIns ||
            instr_map[i].xed_category != XED_CATEGORY_WIDENOP)
          continue;
-       
-       // Form a probing jump instruction:
-       //
-      
-       // Option 1: Use a direct jump for probing:
-       unsigned int olen = encode_jump_instr(instr_map[i].orig_ins_addr, 
-                                             instr_map[i].new_ins_addr, 
-                                             instr_map[i].encoded_ins);
-       if (olen < 0)
+       if (turn_on_switch_head(instr_map[i].orig_ins_addr, instr_map[i].new_ins_addr) < 0) {
+         cerr << "failed to switch the routine at 0x" << hex << instr_map[i].orig_ins_addr
+              << " to TC2 at 0x" << instr_map[i].new_ins_addr << dec << endl;
          return -1;
-  
-       // Option 2: Use an indirect jump for probing:
-       //xed_int64_t new_disp = (ADDRINT)&instr_map[i].new_ins_addr - instr_map[i].orig_ins_addr - olen;
-       //xed_inst1(&enc_instr, dstate,
-       //    XED_ICLASS_JMP, 64,
-       //    xed_mem_bd (XED_REG_RIP, xed_disp(new_disp, 32), 64));
-  
-       //memcpy((ADDRINT *)instr_map[i].orig_ins_addr, instr_map[i].encoded_ins, olen);
-      
-       // Set the probing jump instruction atomically in 2 stages:
-       //
-       
-       // 1st stage: set the last 4 bytes of the probe jmp instr.
-       if (olen > 4)
-         memcpy((char *)(instr_map[i].orig_ins_addr + 4),
-                (char *)((ADDRINT)instr_map[i].encoded_ins + 4), olen - 4);
-       
-       // 2nd stage: set the first 4 bytes of the probe jmp instr.
-       memcpy((char *)instr_map[i].orig_ins_addr, instr_map[i].encoded_ins, 4);
-     
-       //debug print:
-       //cerr << " committing rtN from: 0x" << hex << instr_map[i].orig_ins_addr
-       //    << " to: 0x" << hex << instr_map[i].new_ins_addr 
-       //     << " size: " << olen
-       //     << endl;
-       //dump_instr_from_mem ((ADDRINT *)instr_map[i].orig_ins_addr, instr_map[i].orig_ins_addr);
+       }
   }
-
   return 0;
 }
 
@@ -2783,10 +3283,10 @@ void create_tc2_thread_func(void *v)
 {
     // Wait prof_time seconds for the profiling to count
     // execution frequency for each BBL.
-    cerr << " prof time: " << dec << KnobNumSecsDuringProfile << " sec\n";
+    if (KnobVerbose) cerr << " prof time: " << dec << KnobNumSecsDuringProfile << " sec\n";
     sleep(KnobNumSecsDuringProfile);
 
-    cerr << "disabling profile gathering\n";
+    if (KnobVerbose) cerr << "disabling profile gathering\n";
 
     // disable profiling.
     //  Add a jump at beginning of every profile stub to bypass the
@@ -2812,147 +3312,133 @@ void create_tc2_thread_func(void *v)
     max_ins_count = new_capacity;
     num_of_instr_map_entries = 0;
 
-	// Build orig_to_tc mapping for devirtualization before we lose the old mapping
+    // De-virtualization, step 0: choose the sites on the TC map.
+    // orig_to_tc: original address -> TC address of the first instr with
+    // that original address that is kept in TC2 (its key in the TC2 map).
     std::map<ADDRINT, ADDRINT> orig_to_tc;
     for (unsigned i = 0; i < old_entries; i++) {
-        if (old_map[i].orig_ins_addr && old_map[i].new_ins_addr) {
+        if (old_map[i].orig_ins_addr && !dropped_in_tc2(old_map[i]))
             orig_to_tc.emplace(old_map[i].orig_ins_addr, old_map[i].new_ins_addr);
-        }
     }
+    std::map<unsigned, ADDRINT> tc_devirt_sites;   // TC index -> hot target
+    if (!KnobNoDevirt)
+        find_devirt_sites(old_map, old_entries, orig_to_tc, tc_devirt_sites);
 
-    // ADD THESE 3 DECLARATIONS HERE:
-    ADDRINT current_rtn_head = 0;
-    UINT64 current_rtn_heat = 0;
-    unsigned num_register_promotions = 0;
+    // Register promotion: choose the promoted stack slots of every routine.
+    if (!KnobNoRegPromo)
+        select_promoted_slots(old_map, old_entries);
 
-    // Safely copy and filter instructions into the new map
+    std::map<unsigned, ADDRINT> devirt_sites;      // TC2 index -> hot target
+
+    // Copy the instructions to the new map, without the profiling code.
     for (unsigned i = 0; i < old_entries; i++) {
         const instr_map_t &src = old_map[i];
 
-        // NEW: Track Routine Head for Register Promotion
-        if (src.ins_type == RtnHeadIns) {
-            current_rtn_head = src.orig_ins_addr;
-            current_rtn_heat = bbl_map[src.bbl_num].counter;
-        }
-
-        // 1. Completely strip out heavy profiling stubs
-        if (src.ins_type == ProfilingIns || !src.size) {
-            continue;
-        }
-
-        // 2. Preserve Routine Headers for TC1->TC2 jumps
+        // 1. Keep the routine header entry (its TC2 address is the target of
+        //    the TC -> TC2 jump), but empty: TC2 does not need the NOP.
         if (src.ins_type == RtnHeadIns && src.xed_category == XED_CATEGORY_WIDENOP) {
             instr_map[num_of_instr_map_entries] = src;
-            instr_map[num_of_instr_map_entries].orig_ins_addr = src.new_ins_addr; // TC1 address becomes the new original address
+            instr_map[num_of_instr_map_entries].orig_ins_addr = src.new_ins_addr; // TC address becomes the key
+            instr_map[num_of_instr_map_entries].size = 0;
             instr_map[num_of_instr_map_entries].targ_map_entry = -1;
             num_of_instr_map_entries++;
             continue;
         }
 
-        // 3. Remove unused NOPs
-        if (src.xed_category == XED_CATEGORY_WIDENOP || src.xed_category == XED_CATEGORY_NOP) {
+        // 2. Strip the profiling code and the NOPs.
+        if (dropped_in_tc2(src))
+            continue;
+
+        // 3. Register promotion: access to a promoted stack slot.
+        if (promoted_access.count(src.orig_ins_addr)) {
+            instr_map[num_of_instr_map_entries] = src;
+            instr_map_t &e = instr_map[num_of_instr_map_entries];
+            const promoted_access_t &pa = promoted_access[src.orig_ins_addr];
+            memcpy(e.encoded_ins, pa.encoded_ins, pa.size);
+            e.size = pa.size;
+            e.orig_ins_addr = src.new_ins_addr;
+            e.orig_rip_addr = 0;
+            e.targ_map_entry = -1;
+            num_of_instr_map_entries++;
+            num_register_promotions++;
             continue;
         }
-		
-		// NEW: Apply Profile-Guided Register Promotion
-        bool promoted = false;
-        if (current_rtn_heat > 5000 && regcache_candidates.count(current_rtn_head)) {
-            const regcache_candidate_t &cand = regcache_candidates[current_rtn_head];
-            
-            if (cand.use_rdx && src.orig_ins_addr == cand.spill_rdx_addr) {
-                add_tc2_reg_move(src.new_ins_addr, XED_REG_R10, XED_REG_RDX, src.bbl_num);
-                promoted = true;
-            } else if (cand.use_rcx && src.orig_ins_addr == cand.spill_rcx_addr) {
-                add_tc2_reg_move(src.new_ins_addr, XED_REG_R11, XED_REG_RCX, src.bbl_num);
-                promoted = true;
-            } else if (cand.use_rdx && cand.rdx_loads.count(src.orig_ins_addr)) {
-                add_tc2_reg_move(src.new_ins_addr, XED_REG_RAX, XED_REG_R10, src.bbl_num);
-                promoted = true;
-            } else if (cand.use_rcx && cand.rcx_loads.count(src.orig_ins_addr)) {
-                add_tc2_reg_move(src.new_ins_addr, XED_REG_RAX, XED_REG_R11, src.bbl_num);
-                promoted = true;
-            }
-        }
-        
-        if (promoted) {
-            num_register_promotions++;
-            instr_map[num_of_instr_map_entries - 1].orig_ins_addr = src.new_ins_addr;
-            instr_map[num_of_instr_map_entries - 1].targ_map_entry = -1;
-            continue; // Skip the standard copy below
-        }
-		
-		
 
-        // 4. Standard instruction copy
+        // 4. Standard instruction copy.
+        if (tc_devirt_sites.count(i))
+            devirt_sites[num_of_instr_map_entries] = tc_devirt_sites[i];
+
         instr_map[num_of_instr_map_entries] = src;
-        
-        // The TC1 address becomes the new "original" address for TC2 generation
+
+        // The TC address becomes the key ("original" address) for TC2 generation
         instr_map[num_of_instr_map_entries].orig_ins_addr = src.new_ins_addr;
 
         // Map targets correctly: forward past dropped instructions (like NOPs)
         if (src.targ_map_entry >= 0) {
             unsigned target_idx = src.targ_map_entry;
-            while (target_idx < old_entries) {
-                const instr_map_t &tgt = old_map[target_idx];
-                bool is_dropped = (tgt.ins_type == ProfilingIns || !tgt.size) || 
-                                  (tgt.xed_category == XED_CATEGORY_WIDENOP && tgt.ins_type != RtnHeadIns) ||
-                                  (tgt.xed_category == XED_CATEGORY_NOP);
-                if (!is_dropped) break;
+            while (target_idx < old_entries && dropped_in_tc2(old_map[target_idx]))
                 target_idx++;
-            }
             if (target_idx < old_entries) {
                 instr_map[num_of_instr_map_entries].orig_targ_addr = old_map[target_idx].new_ins_addr;
             }
         }
         instr_map[num_of_instr_map_entries].targ_map_entry = -1;
-        
+
         num_of_instr_map_entries++;
     }
-    cerr << "after modifying instr_map" << endl;
-    
-    std::map<unsigned, ADDRINT> devirt_sites;
+    if (KnobVerbose) cerr << "after modifying instr_map" << endl;
 
     // 1. De-virtualization
-    find_devirt_sites(orig_to_tc, devirt_sites);
-    std::vector<std::pair<unsigned, unsigned> > devirt_internal_branches;
-    insert_devirt_sites(devirt_sites, orig_to_tc, devirt_internal_branches);
+    if (!KnobNoDevirt)
+      insert_devirt_sites(devirt_sites, orig_to_tc);
 
     // 2. Code Reordering
-    if(true)
-    reorder_bbls(devirt_internal_branches);
-    
+    if (!KnobNoReorder)
+      reorder_bbls();
+
     // 3. Loop Unrolling
-    if(true){
-    unroll_single_bbl_loops();
-    if (KnobVerbose) cerr << "Unrolled " << dec << num_unrolled_loops << " single-BBL loops" << endl;
-    }
-    
+    if (!KnobNoUnroll)
+      unroll_single_bbl_loops();
+
     // 4. Leaf Function Inlining
-    if(true){
-    inline_leaf_functions();
-    if (KnobVerbose) cerr << "Inlined " << dec << num_inlined_calls << " leaf functions" << endl;
-    }
-    
+    if (!KnobNoInline)
+      inline_leaf_functions();
+
     // 5. Constant Propagation
-    if(true){
-    apply_constant_propagation();
-    if (KnobVerbose) cerr << "Propagated " << dec << num_constant_propagations << " constants" << endl;
+    if (!KnobNoConstProp)
+      apply_constant_propagation();
+
+    // 6. Remove jumps to the next instruction.
+    remove_jumps_to_next();
+
+    if (KnobStats) {
+      cerr << dec
+           << "TC2 stats: devirt calls=" << num_devirt_calls << " jumps=" << num_devirt_jumps
+           << " (skipped: rare=" << num_devirt_skip_rare
+           << " not_translated=" << num_devirt_skip_not_translated
+           << " far=" << num_devirt_skip_far_targ << " other=" << num_devirt_skip_other << ")\n"
+           << "TC2 stats: reordered rtns=" << num_reordered_rtns
+           << " moved cold bbls=" << num_moved_cold_bbls
+           << " reversed jcc=" << num_reversed_cond_branches
+           << " added jmps=" << num_added_fallthru_jumps
+           << " removed jmps=" << num_removed_jumps << "\n"
+           << "TC2 stats: unrolled loops=" << num_unrolled_loops
+           << " inlined calls=" << num_inlined_calls
+           << " const props=" << num_constant_propagations << "\n"
+           << "TC2 stats: promoted slots=" << num_promoted_slots << " in " << num_promoted_rtns
+           << " rtns, rewritten accesses=" << num_register_promotions << "\n";
     }
-    
+
     // Step 3: Chaining - calculate direct branch and call instructions to point
     //         to corresponding target instr entries:
     //
     chain_all_direct_jmp_and_call_target_entries(0, num_of_instr_map_entries);
-    cerr << "after chaining all branch targets" << endl;
-    
-    for (unsigned k = 0; k < devirt_internal_branches.size(); k++) {
-    instr_map[devirt_internal_branches[k].first].targ_map_entry = devirt_internal_branches[k].second;
-    }
+    if (KnobVerbose) cerr << "after chaining all branch targets" << endl;
 
     // Step 4: Set initial estimated new addrs for each instruction in tc2.
     //
     set_initial_estimated_new_ins_addrs_in_tc(tc2);
-    cerr << "after setting initial estimated new ins addrs in tc2" << endl;
+    if (KnobVerbose) cerr << "after setting initial estimated new ins addrs in tc2" << endl;
 
     // Step 5: fix rip-based, direct branch and direct call displacements:
     //
@@ -2961,7 +3447,7 @@ void create_tc2_thread_func(void *v)
         cerr << "failed to fix displacments of translated instructions\n";
         return;
     }
-    cerr << "after fixing instructions displacements" << endl;
+    if (KnobVerbose) cerr << "after fixing instructions displacements" << endl;
 
     // Step 6: write translated instructions to tc2:
     //
@@ -2971,7 +3457,7 @@ void create_tc2_thread_func(void *v)
         return;
     }
     tc2_size = rc;
-    cerr << "after write all new instructions to tc2" << endl;
+    if (KnobVerbose) cerr << "after write all new instructions to tc2" << endl;
 
     // Step 7: Commit the translated routines:
     //         Go over the candidate functions and replace the original ones
@@ -2984,7 +3470,7 @@ void create_tc2_thread_func(void *v)
           cerr << "failed to commit jump instructions from TC to TC2\n";
           return;
       }
-      cerr << "after commit of translated routines from TC to TC2" << endl;
+      if (KnobVerbose) cerr << "after commit of translated routines from TC to TC2" << endl;
     }
 
     if (KnobDumpTranslatedCode2) {
@@ -3075,6 +3561,7 @@ int allocate_and_init_memory(IMG img)
     // CRITICAL FIX: Map BBL counters to the localized 32-bit memory block
     bbl_map = reinterpret_cast<bbl_map_t *>(addr);
     memset(bbl_map, 0, max_ins_count * sizeof(bbl_map_t));
+    max_bbl_count = max_ins_count;
 
     instr_map = (instr_map_t *)calloc(max_ins_count, sizeof(instr_map_t));
     if (instr_map == NULL) return -1;
@@ -3094,16 +3581,25 @@ EXITFUNCPTR origExit;
 /********/
 VOID Fini(INT32 code, VOID* v)
 {
-    cerr << "Reached _exit." << endl;
+    if (KnobVerbose) cerr << "Reached _exit." << endl;
 
     clock_gettime(CLOCK_MONOTONIC, &end_running_time);
 
-    dump_profile();
+    if (KnobDumpProfile && out)
+      dump_profile();
 
-    double elapsed = (end_running_time.tv_sec - start_running_time.tv_sec) + 
-                     (end_running_time.tv_nsec - start_running_time.tv_nsec) / 1e9;
-	cerr << " Translated code run (including profiling) took: "
-	     << elapsed + KnobNumSecsDuringProfile << " seconds\n";
+    double elapsed;
+    if (start_running_time.tv_sec || start_running_time.tv_nsec) {
+      elapsed = (end_running_time.tv_sec - start_running_time.tv_sec) +
+                (end_running_time.tv_nsec - start_running_time.tv_nsec) / 1e9 +
+                KnobNumSecsDuringProfile;
+    } else {
+      // The program ended before TC2 was committed.
+      elapsed = (end_running_time.tv_sec - tool_start_time.tv_sec) +
+                (end_running_time.tv_nsec - tool_start_time.tv_nsec) / 1e9;
+    }
+    cerr << " Translated code run (including profiling) took: "
+         << elapsed << " seconds\n";
 }
 
 /*******************/
@@ -3144,7 +3640,7 @@ VOID create_tc(IMG img, VOID *v)
         cerr << "failed to initialize memory for translation\n";
         return;
     }
-    cerr << "after memory allocation" << endl;
+    if (KnobVerbose) cerr << "after memory allocation" << endl;
 
     // Step 2: go over all routines and identify candidate routines and copy
     //         their code into the instr map IR:
@@ -3153,12 +3649,12 @@ VOID create_tc(IMG img, VOID *v)
         cerr << "failed to find candidates for translation\n";
         return;
     }
-    cerr << "after identifying candidate routines" << endl;
+    if (KnobVerbose) cerr << "after identifying candidate routines" << endl;
 
     // Step 3: Chaining - calculate direct branch and call instructions to point
     //         to corresponding target instr entries:
     chain_all_direct_jmp_and_call_target_entries(0, num_of_instr_map_entries);
-    cerr << "after chaining all branch targets" << endl;
+    if (KnobVerbose) cerr << "after chaining all branch targets" << endl;
 
     // Step 4: Set initial estimated new addrs for each instruction in the tc.
     rc = set_initial_estimated_new_ins_addrs_in_tc(tc);
@@ -3166,7 +3662,7 @@ VOID create_tc(IMG img, VOID *v)
         cerr << "failed to set initial estimated new ins addrs in the TC\n";
         return;
     }
-    cerr << "after setting initial estimated new ins addrs in the TC" << endl;
+    if (KnobVerbose) cerr << "after setting initial estimated new ins addrs in the TC" << endl;
 
     // Step 5: fix rip-based, direct branch and direct call displacements:
     rc = fix_instructions_displacements();
@@ -3174,7 +3670,7 @@ VOID create_tc(IMG img, VOID *v)
         cerr << "failed to fix displacments of translated instructions\n";
         return;
     }
-    cerr << "after fixing instructions displacements" << endl;
+    if (KnobVerbose) cerr << "after fixing instructions displacements" << endl;
 
     // Step 6: write translated instructions to the tc:
     rc = copy_instrs_to_tc(tc);
@@ -3183,7 +3679,7 @@ VOID create_tc(IMG img, VOID *v)
         return;
     }
     tc_size = rc;
-    cerr << "after write all new instructions to memory tc" << endl;
+    if (KnobVerbose) cerr << "after write all new instructions to memory tc" << endl;
 
     if (KnobDumpTranslatedCode) {
        cerr << "Translation Cache dump:" << endl;
@@ -3198,14 +3694,14 @@ VOID create_tc(IMG img, VOID *v)
     //         by their new successfully translated ones:
     if (!KnobDoNotCommitTranslatedCode) {
       commit_translated_rtns_to_tc();
-      cerr << "after commit of translated routines from orig code to TC" << endl;
+      if (KnobVerbose) cerr << "after commit of translated routines from orig code to TC" << endl;
     }
 
     struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &end);
     double elapsed = (end.tv_sec - start.tv_sec) +
 	                 (end.tv_nsec - start.tv_nsec) / 1e9;
-    cerr << " create_tc took: " << elapsed << " seconds\n";
+    if (KnobVerbose) cerr << " create_tc took: " << elapsed << " seconds\n";
 }
 
 
@@ -3230,11 +3726,15 @@ INT32 Usage()
 int main(int argc, char * argv[])
 {
     // Open output profile file.
-    out = new std::ofstream("bprofile.out");
+    clock_gettime(CLOCK_MONOTONIC, &tool_start_time);
 
     // Initialize pin & symbol manager
     if( PIN_Init(argc,argv) )
         return Usage();
+
+    // Open output profile file (only when the profile dump is requested).
+    if (KnobDumpProfile)
+      out = new std::ofstream("bprofile.out");
 
     PIN_InitSymbols();
 
